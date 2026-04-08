@@ -125,14 +125,35 @@ impl DeviceManager {
     pub fn discover_devices(&mut self) {
         match HidApi::new() {
             Ok(api) => {
-                // On Windows the hidapi windows-native backend enumerates HID
-                // collections. Interface/collection 0 is the main EC interface
-                // on every Razer Blade tested.
-                let devices: Vec<_> = api
+                // Collect all Razer HID interfaces (no interface-number filter).
+                // On Windows the hidapi windows-native backend enumerates every
+                // USB HID interface as a separate entry.  Interface 0 is the
+                // boot-keyboard and has no Feature report descriptor, so
+                // HidD_SetFeature fails there with ERROR_INVALID_FUNCTION.
+                // The Razer proprietary EC control channel is usually interface 2
+                // on Blade laptops, so we sort descending and pick the first
+                // interface that opens successfully.
+                let mut devices: Vec<_> = api
                     .device_list()
                     .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
-                    .filter(|d| d.interface_number() == 0)
                     .collect();
+
+                // Log every detected Razer interface for diagnostics.
+                for d in &devices {
+                    debug!(
+                        "Razer HID candidate: PID=0x{:04X} iface={} \
+                         usage_page=0x{:04X} usage=0x{:04X} path={}",
+                        d.product_id(),
+                        d.interface_number(),
+                        d.usage_page(),
+                        d.usage(),
+                        d.path().to_string_lossy()
+                    );
+                }
+
+                // Sort descending so we try interface 2 (Razer control) before
+                // interface 1 and 0.  Interfaces with number -1 sort last.
+                devices.sort_by(|a, b| b.interface_number().cmp(&a.interface_number()));
 
                 for device in devices {
                     let result = self
@@ -140,7 +161,11 @@ impl DeviceManager {
                     if let Some(supported) = result {
                         match api.open_path(device.path()) {
                             Ok(dev) => {
-                                info!("Opened HID device: {}", supported.name);
+                                info!(
+                                    "Opened HID device: {} (interface {})",
+                                    supported.name,
+                                    device.interface_number()
+                                );
                                 self.device = Some(RazerLaptop::new(
                                     supported.name.clone(),
                                     supported.features.clone(),
@@ -150,14 +175,20 @@ impl DeviceManager {
                                 return;
                             }
                             Err(e) => {
-                                error!(
-                                    "Failed to open HID device (try running as Administrator): {}",
+                                debug!(
+                                    "Could not open interface {}: {}",
+                                    device.interface_number(),
                                     e
                                 );
                             }
                         }
                     }
                 }
+                error!(
+                    "No supported Razer HID interface could be opened.\n\
+                     • Make sure Razer Synapse services are STOPPED.\n\
+                     • Run this daemon as Administrator."
+                );
             }
             Err(e) => error!("HidApi init error: {}", e),
         }
