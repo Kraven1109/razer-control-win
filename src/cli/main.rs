@@ -58,6 +58,7 @@ enum ReadAttr {
     Power(AcStateParam),
     Brightness(AcStateParam),
     Logo(AcStateParam),
+    FnSwap,
     Sync,
     Bho,
 }
@@ -68,6 +69,7 @@ enum WriteAttr {
     Power(PowerParams),
     Brightness(BrightnessParams),
     Logo(LogoParams),
+    FnSwap(FnSwapParams),
     Sync(SyncParams),
     Bho(BhoParams),
 }
@@ -101,6 +103,11 @@ struct LogoParams {
 #[derive(Parser)]
 struct SyncParams {
     sync_state: OnOff,
+}
+
+#[derive(Parser)]
+struct FnSwapParams {
+    state: OnOff,
 }
 
 #[derive(Parser)]
@@ -286,6 +293,7 @@ fn main() {
             ReadAttr::Power(AcStateParam { ac_state }) => read_power_mode(ac_state as usize),
             ReadAttr::Brightness(AcStateParam { ac_state }) => read_brightness(ac_state as usize),
             ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state as usize),
+            ReadAttr::FnSwap => read_fn_swap(),
             ReadAttr::Sync => read_sync(),
             ReadAttr::Bho => read_bho(),
         },
@@ -297,6 +305,7 @@ fn main() {
             WriteAttr::Brightness(BrightnessParams { ac_state, brightness }) => {
                 write_brightness(ac_state as usize, brightness as u8)
             }
+            WriteAttr::FnSwap(FnSwapParams { state }) => write_fn_swap(state.is_on()),
             WriteAttr::Sync(SyncParams { sync_state }) => write_sync(sync_state.is_on()),
             WriteAttr::Logo(LogoParams { ac_state, logo_state }) => {
                 write_logo_mode(ac_state as usize, logo_state as u8)
@@ -477,6 +486,22 @@ fn read_sync() {
     }
 }
 
+fn read_fn_swap() {
+    match send_data(comms::DaemonCommand::GetFnSwap()) {
+        Some(comms::DaemonResponse::GetFnSwap { swap }) => {
+            println!(
+                "Fn swap: {}",
+                if swap {
+                    "ON (media keys primary)"
+                } else {
+                    "OFF (F-keys primary)"
+                }
+            );
+        }
+        _ => eprintln!("Failed to read Fn swap state"),
+    }
+}
+
 fn read_bho() {
     match send_data(comms::DaemonCommand::GetBatteryHealthOptimizer()) {
         Some(comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold }) => {
@@ -605,6 +630,16 @@ fn write_sync(sync: bool) {
     match send_data(comms::DaemonCommand::SetSync { sync }) {
         Some(_) => read_sync(),
         None => eprintln!("Failed to set sync"),
+    }
+}
+
+fn write_fn_swap(swap: bool) {
+    match send_data(comms::DaemonCommand::SetFnSwap { swap }) {
+        Some(comms::DaemonResponse::SetFnSwap { result: true }) => read_fn_swap(),
+        Some(comms::DaemonResponse::SetFnSwap { result: false }) => eprintln!(
+            "Fn swap write was rejected or did not persist on this device"
+        ),
+        _ => eprintln!("Failed to set Fn swap"),
     }
 }
 

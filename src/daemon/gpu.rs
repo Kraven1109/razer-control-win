@@ -1,17 +1,15 @@
 /// GPU monitoring for Windows.
 ///
-/// Strategy (lightweight, no background services):
+/// Strategy:
 ///
-/// 1. **nvidia-smi.exe** (primary) — ships with every NVIDIA driver package on
-///    Windows.  Same CSV query as the Linux build.  Gives full data: util,
-///    temp, power, VRAM, clocks.
-///
-/// 2. **PDH performance counters** (fallback) — the same API that Task Manager
-///    uses.  Zero-overhead kernel counters via PdhOpenQuery/PdhCollectQueryData.
-///    Gives GPU utilisation + VRAM; no temperature or power data.
+/// 1. Prefer `nvidia-smi` for the discrete NVIDIA GPU. This gives accurate
+///    temperature, power, clocks, and dedicated VRAM for the graph.
+/// 2. Fall back to PDH / Task Manager counters when `nvidia-smi` is not
+///    available. PDH is still useful for lightweight telemetry, but it is not
+///    reliable enough on its own for all metrics on Optimus systems.
 ///
 /// The GPU monitor thread calls `query_gpu()` every few seconds and stores the
-/// result in `GPU_STATUS_CACHE` which the daemon reads for GetGpuStatus IPC.
+/// result in `GPU_STATUS_CACHE` which the daemon reads for `GetGpuStatus` IPC.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -55,32 +53,24 @@ pub fn get_cached_gpu_status() -> Option<GpuStatus> {
     GPU_STATUS_CACHE.lock().ok().and_then(|g| g.clone())
 }
 
-/// Main query entry point — tries nvidia-smi first, falls back to PDH.
+/// Main query entry point — prefer NVIDIA telemetry, fall back to PDH.
 pub fn query_gpu() -> Option<GpuStatus> {
-    if let Some(s) = query_nvidia_smi() {
-        return Some(s);
-    }
-    query_pdh_gpu()
+    query_nvidia_smi().or_else(query_pdh_gpu)
 }
 
-// ── nvidia-smi path detection ──────────────────────────────────────────────
-
 fn find_nvidia_smi() -> Option<PathBuf> {
-    // 1. Try plain name — covers System32 and anything in PATH
     if Command::new("nvidia-smi.exe")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .ok()?
+        .success()
     {
         return Some(PathBuf::from("nvidia-smi.exe"));
     }
 
-    // 2. Classic NVSMI directory (older driver layouts)
-    let classic = PathBuf::from(
-        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-    );
+    let classic = PathBuf::from(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe");
     if classic.exists() {
         return Some(classic);
     }
@@ -88,47 +78,100 @@ fn find_nvidia_smi() -> Option<PathBuf> {
     None
 }
 
-// ── nvidia-smi query — identical CSV format to the Linux build ──────────────
+fn parse_nvidia_smi_line(line: &str) -> Option<GpuStatus> {
+    fn parse_u8(input: &str) -> u8 {
+        input.trim().parse().unwrap_or(0)
+    }
+
+    fn parse_u32(input: &str) -> u32 {
+        input.trim().parse().unwrap_or(0)
+    }
+
+    fn parse_i32(input: &str) -> i32 {
+        input.trim().parse().unwrap_or(0)
+    }
+
+    fn parse_f32(input: &str) -> f32 {
+        input.trim().parse().unwrap_or(0.0)
+    }
+
+    let parts: Vec<&str> = line.split(',').map(|part| part.trim()).collect();
+    if parts.len() < 11 {
+        return None;
+    }
+
+    Some(GpuStatus {
+        name: parts[0].to_string(),
+        temp_c: parse_i32(parts[1]),
+        gpu_util: parse_u8(parts[2]),
+        mem_util: parse_u8(parts[3]),
+        power_w: parse_f32(parts[4]),
+        power_limit_w: parse_f32(parts[5]),
+        power_max_limit_w: parse_f32(parts[6]),
+        mem_used_mb: parse_u32(parts[7]),
+        mem_total_mb: parse_u32(parts[8]),
+        clock_gpu_mhz: parse_u32(parts[9]),
+        clock_mem_mhz: parse_u32(parts[10]),
+    })
+}
 
 fn query_nvidia_smi() -> Option<GpuStatus> {
-    let exe = find_nvidia_smi()?;
-
+    let exe = match find_nvidia_smi() {
+        Some(exe) => exe,
+        None => {
+            debug!("nvidia-smi not found; using PDH fallback");
+            return None;
+        }
+    };
     let output = Command::new(exe)
         .args([
-            "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,\
-             power.draw,enforced.power.limit,power.max_limit,\
-             memory.used,memory.total,clocks.gr,clocks.mem",
+            "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,enforced.power.limit,power.max_limit,memory.used,memory.total,clocks.gr,clocks.mem",
             "--format=csv,noheader,nounits",
         ])
-        .output()
-        .ok()?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            debug!("failed to spawn nvidia-smi: {err}");
+            return None;
+        }
+    };
 
     if !output.status.success() {
+        debug!(
+            "nvidia-smi returned non-zero status: {} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
         return None;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_nvidia_smi_line(stdout.trim())
-}
-
-fn parse_nvidia_smi_line(line: &str) -> Option<GpuStatus> {
-    let parts: Vec<&str> = line.splitn(11, ", ").collect();
-    if parts.len() < 11 {
-        return None;
-    }
-    Some(GpuStatus {
-        name: parts[0].to_string(),
-        temp_c: parts[1].trim().parse().unwrap_or(0),
-        gpu_util: parts[2].trim().parse().unwrap_or(0),
-        mem_util: parts[3].trim().parse().unwrap_or(0),
-        power_w: parts[4].trim().parse().unwrap_or(0.0),
-        power_limit_w: parts[5].trim().parse().unwrap_or(0.0),
-        power_max_limit_w: parts[6].trim().parse().unwrap_or(0.0),
-        mem_used_mb: parts[7].trim().parse().unwrap_or(0),
-        mem_total_mb: parts[8].trim().parse().unwrap_or(0),
-        clock_gpu_mhz: parts[9].trim().parse().unwrap_or(0),
-        clock_mem_mhz: parts[10].trim().parse().unwrap_or(0),
-    })
+    let line = match stdout.lines().find(|line| !line.trim().is_empty()) {
+        Some(line) => line,
+        None => {
+            debug!("nvidia-smi produced no CSV data");
+            return None;
+        }
+    };
+    let sample = match parse_nvidia_smi_line(line) {
+        Some(sample) => sample,
+        None => {
+            debug!("failed to parse nvidia-smi CSV line: {line}");
+            return None;
+        }
+    };
+    debug!(
+        "nvidia-smi GPU: util={}%, mem={} / {}MB, temp={}°C, power={:.1}W/{:.1}W",
+        sample.gpu_util,
+        sample.mem_used_mb,
+        sample.mem_total_mb,
+        sample.temp_c,
+        sample.power_w,
+        sample.power_limit_w,
+    );
+    Some(sample)
 }
 
 // ── PDH fallback — Windows Performance Data Helper ─────────────────────────
@@ -136,11 +179,12 @@ fn parse_nvidia_smi_line(line: &str) -> Option<GpuStatus> {
 // Uses the same counters exposed in Task Manager:
 //   \GPU Engine(*engtype_3D)\Utilization Percentage
 //   \GPU Adapter Memory(*)\Dedicated Usage
-//   \GPU Adapter Memory(*)\Dedicated Limit
+//   \GPU Local Adapter Memory(*)\Local Usage
 //
 // PDH wildcard counters return arrays (one entry per GPU engine / adapter).
-// We aggregate: max across 3D engine instances for utilisation, sum across
-// adapters for VRAM (usually just one discrete adapter).
+// We aggregate conservatively: max across 3D engine instances and max across
+// adapter memory instances. This keeps the fallback simple and typically picks
+// the discrete adapter on systems where it exposes dedicated memory usage.
 
 #[cfg(windows)]
 fn query_pdh_gpu() -> Option<GpuStatus> {
@@ -209,42 +253,6 @@ fn query_pdh_gpu() -> Option<GpuStatus> {
         }
     }
 
-    unsafe fn get_array_sum(hc: PDH_HCOUNTER) -> Option<f64> {
-        unsafe {
-            let mut buf_size: u32 = 0;
-            let mut count: u32 = 0;
-            let _ = PdhGetFormattedCounterArrayW(
-                hc,
-                PDH_FMT_DOUBLE,
-                &mut buf_size,
-                &mut count,
-                None,
-            );
-            if buf_size == 0 {
-                return None;
-            }
-            let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            let needed = (buf_size as usize).max(item_size * count as usize);
-            let mut buf: Vec<u8> = vec![0u8; needed];
-            let items_ptr = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-            let ret = PdhGetFormattedCounterArrayW(
-                hc,
-                PDH_FMT_DOUBLE,
-                &mut buf_size,
-                &mut count,
-                Some(items_ptr),
-            );
-            if ret != 0 {
-                return None;
-            }
-            let mut sum = 0.0_f64;
-            for i in 0..count as usize {
-                sum += (*items_ptr.add(i)).FmtValue.Anonymous.doubleValue;
-            }
-            Some(sum)
-        }
-    }
-
     unsafe {
         let mut query: PDH_HQUERY = 0;
         if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
@@ -254,14 +262,23 @@ fn query_pdh_gpu() -> Option<GpuStatus> {
         let mut h_util: PDH_HCOUNTER = 0;
         let mut h_vram_used: PDH_HCOUNTER = 0;
         let mut h_vram_total: PDH_HCOUNTER = 0;
+        let mut h_temp: PDH_HCOUNTER = 0;
 
-        let path_util = wide("\\GPU Engine(*engtype_3D)\\Utilization Percentage");
-        let path_used = wide("\\GPU Adapter Memory(*)\\Dedicated Usage");
+        let path_util  = wide("\\GPU Engine(*engtype_3D)\\Utilization Percentage");
+        // Use max instead of sum for memory counters — the RTX 4090 has the
+        // largest dedicated VRAM budget, so max() selects that adapter and
+        // ignores the Intel iGPU (which shows a much smaller or zero value).
+        let path_used  = wide("\\GPU Adapter Memory(*)\\Dedicated Usage");
         let path_total = wide("\\GPU Adapter Memory(*)\\Dedicated Limit");
+        // Wildcard thermal counter — discrete GPU is hotter, so max gives RTX temp.
+        let path_temp  = wide("\\GPU Thermal(*)\\Temperature");
 
-        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_util.as_ptr()), 0, &mut h_util);
-        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_used.as_ptr()), 0, &mut h_vram_used);
+        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_util.as_ptr()),  0, &mut h_util);
+        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_used.as_ptr()),  0, &mut h_vram_used);
         let _ = PdhAddEnglishCounterW(query, PCWSTR(path_total.as_ptr()), 0, &mut h_vram_total);
+        // Thermal counter: ignore failure — not present on all systems/drivers.
+        let temp_added =
+            PdhAddEnglishCounterW(query, PCWSTR(path_temp.as_ptr()), 0, &mut h_temp) == 0;
 
         // First collection — needed before rate counters produce values
         let _ = PdhCollectQueryData(query);
@@ -273,12 +290,21 @@ fn query_pdh_gpu() -> Option<GpuStatus> {
         }
 
         let util = get_array_max(h_util).unwrap_or(0.0).min(100.0);
-        let vram_used_bytes = get_array_sum(h_vram_used).unwrap_or(0.0);
-        let vram_total_bytes = get_array_sum(h_vram_total).unwrap_or(0.0);
+        // Use max to pick the discrete RTX adapter (largest VRAM budget).
+        let vram_used_bytes  = get_array_max(h_vram_used).unwrap_or(0.0);
+        let vram_total_bytes = get_array_max(h_vram_total).unwrap_or(0.0);
+
+        // Temperature: max across all thermal instances — RTX runs hotter and
+        // exposes a real sensor; iGPU either returns 0 or a lower value.
+        let temp_c = if temp_added {
+            get_array_max(h_temp).unwrap_or(0.0).clamp(0.0, 150.0) as i32
+        } else {
+            0
+        };
 
         PdhCloseQuery(query);
 
-        let mem_used_mb = (vram_used_bytes / 1_048_576.0) as u32;
+        let mem_used_mb  = (vram_used_bytes  / 1_048_576.0) as u32;
         let mem_total_mb = (vram_total_bytes / 1_048_576.0) as u32;
         let mem_util = if mem_total_mb > 0 {
             (mem_used_mb * 100 / mem_total_mb) as u8
@@ -287,16 +313,17 @@ fn query_pdh_gpu() -> Option<GpuStatus> {
         };
 
         debug!(
-            "PDH GPU: util={:.1}% vram={}/{}MB",
-            util, mem_used_mb, mem_total_mb
+            "PDH GPU: util={:.1}% vram={}/{}MB temp={}°C",
+            util, mem_used_mb, mem_total_mb, temp_c
         );
 
         Some(GpuStatus {
-            name: "GPU (PDH)".to_string(),
+            name: "GPU (Task Manager counters)".to_string(),
             gpu_util: util as u8,
             mem_util,
             mem_used_mb,
             mem_total_mb,
+            temp_c,
             ..Default::default()
         })
     }
@@ -305,4 +332,26 @@ fn query_pdh_gpu() -> Option<GpuStatus> {
 #[cfg(not(windows))]
 fn query_pdh_gpu() -> Option<GpuStatus> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_nvidia_smi_line;
+
+    #[test]
+    fn parse_nvidia_smi_csv_line() {
+        let sample = parse_nvidia_smi_line(
+            "NVIDIA GeForce RTX 4090 Laptop GPU, 73, 43, 1, 106.20, 110.32, 175.00, 197, 16376, 210, 405"
+        )
+        .expect("nvidia-smi line should parse");
+
+        assert_eq!(sample.name, "NVIDIA GeForce RTX 4090 Laptop GPU");
+        assert_eq!(sample.temp_c, 73);
+        assert_eq!(sample.gpu_util, 43);
+        assert_eq!(sample.mem_util, 1);
+        assert_eq!(sample.mem_used_mb, 197);
+        assert_eq!(sample.mem_total_mb, 16376);
+        assert!((sample.power_w - 106.20).abs() < 0.01);
+        assert!((sample.power_limit_w - 110.32).abs() < 0.01);
+    }
 }

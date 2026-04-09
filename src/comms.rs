@@ -38,6 +38,9 @@ pub enum DaemonCommand {
     GetPowerLimits { ac: usize },
     SetPowerLimits { ac: usize, pl1_watts: u32, pl2_watts: u32 },
     GetCurrentEffect,
+    SetFnSwap { swap: bool },
+    GetFnSwap(),
+    SetGamingMode { win_key: bool, alt_tab: bool, alt_f4: bool },
 }
 
 // ── Responses sent FROM the daemon ────────────────────────────────────────
@@ -84,6 +87,9 @@ pub enum DaemonResponse {
     },
     SetPowerLimits { result: bool },
     GetCurrentEffect { name: String, args: Vec<u8> },
+    SetFnSwap { result: bool },
+    GetFnSwap { swap: bool },
+    SetGamingMode { result: bool },
 }
 
 // ── Client helpers ─────────────────────────────────────────────────────────

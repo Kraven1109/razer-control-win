@@ -24,6 +24,8 @@ use log::*;
 mod comms;
 mod config;
 mod device;
+#[path = "../gui/gaming_mode.rs"]
+mod gaming_mode;
 mod gpu;
 mod kbd;
 mod power;
@@ -298,6 +300,15 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                         }
                     }
                 }
+                // Persist immediately so the effect survives a crash / force-kill.
+                if res {
+                    if let Ok(mut k) = EFFECT_MANAGER.lock() {
+                        let json = k.save();
+                        if let Err(e) = config::Configuration::write_effects_save(json) {
+                            error!("Failed to save effects: {}", e);
+                        }
+                    }
+                }
                 Some(comms::DaemonResponse::SetEffect { result: res })
             }
             comms::DaemonCommand::SetStandardEffect { name, params } => {
@@ -389,6 +400,33 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                     .and_then(|mut k| k.get_current_effect_info())
                     .unwrap_or_else(|| (String::new(), vec![]));
                 Some(comms::DaemonResponse::GetCurrentEffect { name, args })
+            }
+            comms::DaemonCommand::SetFnSwap { swap } => {
+                let ok = d.set_fn_swap_handler(swap);
+                if ok {
+                    info!("Fn key swap verified at state {}", swap);
+                } else {
+                    warn!(
+                        "Fn key swap write did not persist; Blade 16 likely needs the proprietary Synapse path"
+                    );
+                }
+                Some(comms::DaemonResponse::SetFnSwap { result: ok })
+            }
+            comms::DaemonCommand::GetFnSwap() => {
+                let swap = d.get_fn_swap_handler().unwrap_or(false);
+                Some(comms::DaemonResponse::GetFnSwap { swap })
+            }
+            comms::DaemonCommand::SetGamingMode {
+                win_key,
+                alt_tab,
+                alt_f4,
+            } => {
+                gaming_mode::set_blocks(win_key, alt_tab, alt_f4);
+                info!(
+                    "Gaming mode blocks updated: win_key={} alt_tab={} alt_f4={}",
+                    win_key, alt_tab, alt_f4
+                );
+                Some(comms::DaemonResponse::SetGamingMode { result: true })
             }
         };
     }

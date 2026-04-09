@@ -323,11 +323,12 @@ impl DeviceManager {
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 let val = laptop.get_brightness() as u32;
-                return (val * 100 * 100 / 255 + 50) as u8 / 100;
+                // Convert 0-255 → 0-100, rounding correctly.
+                return ((val * 100 + 127) / 255) as u8;
             }
         }
         self.get_ac_config(ac)
-            .map(|c| ((c.brightness as u32 * 100 * 100 / 255 + 50) / 100) as u8)
+            .map(|c| ((c.brightness as u32 * 100 + 127) / 255) as u8)
             .unwrap_or(0)
     }
 
@@ -341,29 +342,17 @@ impl DeviceManager {
     }
 
     pub fn get_power_mode(&mut self, ac: usize) -> u8 {
-        if let Some(laptop) = self.get_device() {
-            if laptop.ac_state as usize == ac {
-                return laptop.get_power_mode(0x01);
-            }
-        }
+        // Always return the config value (in-memory ground truth).
+        // Querying the EC directly is unreliable: the hardware may report
+        // a stale/default value if Synapse or the EC hasn't settled yet.
         self.get_ac_config(ac).map(|c| c.power_mode).unwrap_or(0)
     }
 
     pub fn get_cpu_boost(&mut self, ac: usize) -> u8 {
-        if let Some(laptop) = self.get_device() {
-            if laptop.ac_state as usize == ac {
-                return laptop.get_cpu_boost();
-            }
-        }
         self.get_ac_config(ac).map(|c| c.cpu_boost).unwrap_or(0)
     }
 
     pub fn get_gpu_boost(&mut self, ac: usize) -> u8 {
-        if let Some(laptop) = self.get_device() {
-            if laptop.ac_state as usize == ac {
-                return laptop.get_gpu_boost();
-            }
-        }
         self.get_ac_config(ac).map(|c| c.gpu_boost).unwrap_or(0)
     }
 
@@ -420,6 +409,31 @@ impl DeviceManager {
     pub fn get_bho_handler(&mut self) -> Option<(bool, u8)> {
         self.get_device()
             .and_then(|l| l.get_bho().map(byte_to_bho))
+    }
+
+    pub fn get_fn_swap_handler(&mut self) -> Option<bool> {
+        self.get_device().and_then(|l| l.get_fn_swap())
+    }
+
+    pub fn set_fn_swap_handler(&mut self, swap: bool) -> bool {
+        let Some(laptop) = self.get_device() else {
+            return false;
+        };
+
+        if !laptop.set_fn_swap(swap) {
+            return false;
+        }
+
+        for _ in 0..3 {
+            thread::sleep(time::Duration::from_millis(40));
+            if let Some(current) = laptop.get_fn_swap() {
+                if current == swap {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// RAPL not available on Windows — return stored (0,0) values.
@@ -567,6 +581,7 @@ impl RazerLaptop {
         self.send_report(report).is_some()
     }
 
+    #[allow(dead_code)]
     pub fn get_power_mode(&mut self, zone: u8) -> u8 {
         let mut report = RazerPacket::new(0x0d, 0x82, 0x04);
         report.args[0] = 0x00;
@@ -583,6 +598,7 @@ impl RazerLaptop {
         self.send_report(report).is_some()
     }
 
+    #[allow(dead_code)]
     pub fn get_cpu_boost(&mut self) -> u8 {
         let mut report = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x00;
@@ -601,6 +617,7 @@ impl RazerLaptop {
         self.send_report(report).is_some()
     }
 
+    #[allow(dead_code)]
     pub fn get_gpu_boost(&mut self) -> u8 {
         let mut report = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x00;
@@ -715,6 +732,23 @@ impl RazerLaptop {
             debug!("BHO response: {:?}", r);
             true
         })
+    }
+
+    /// Get whether Fn key swap is active (true = media keys primary).
+    pub fn get_fn_swap(&mut self) -> Option<bool> {
+        let mut report = RazerPacket::new(0x02, 0x86, 0x02);
+        report.id = 0xFF; // Fn toggle uses 0xFF per OpenRazer razer_chroma_misc_fn_key_toggle
+        report.args[0] = 0x00;
+        self.send_report(report).map(|r| r.args[1] != 0)
+    }
+
+    /// Set Fn key swap: false = F-keys primary, true = media keys primary.
+    pub fn set_fn_swap(&mut self, swap: bool) -> bool {
+        let mut report = RazerPacket::new(0x02, 0x06, 0x02);
+        report.id = 0xFF; // Fn toggle uses 0xFF per OpenRazer razer_chroma_misc_fn_key_toggle
+        report.args[0] = 0x00;
+        report.args[1] = swap as u8;
+        self.send_report(report).is_some()
     }
 
     fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
