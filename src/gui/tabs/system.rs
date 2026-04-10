@@ -241,9 +241,10 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
             // ── Side-by-side: GPU card (left 50%) + System card (right 50%) ──
             {
                 const TILE_H: f32 = 96.0;
-                const SPC: f32 = 8.0;
-                const CARD_GAP: f32 = 10.0;
-                let left_w = ((total_w - CARD_GAP) * 0.58).floor();
+                const SPC: f32 = 4.0;
+                const CARD_GAP: f32 = 14.0;
+                // let left_w = 210.0;
+                let left_w = ((total_w - CARD_GAP) * 0.57).floor();
                 let right_w = (total_w - CARD_GAP - left_w).max(0.0);
 
                 // Pre-compute all tile data before the layout borrowing begins.

@@ -53,4 +53,5 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",           # CreateFileW for NVMe temperature IOCTL
     "Win32_Security",                     # Required by CreateFileW signature
     "Win32_System_IO",                    # DeviceIoControl
+    "Win32_Devices_DeviceAndDriverInstallation", # SetupDi for thermal zone enumeration
 ] }
