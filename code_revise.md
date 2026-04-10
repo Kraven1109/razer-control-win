@@ -1,193 +1,188 @@
-### 2. Lấy nhiệt độ CPU, SSD, Mainboard (An toàn & Không wake dGPU)
-Các linh kiện này sử dụng các bus giao tiếp hoàn toàn khác (SMBus, I2C, hoặc tích hợp thẳng trong CPU package) và không liên quan gì đến bus PCIe của card rời. Bạn có thể đọc chúng thoải mái mỗi 1-2 giây mà không lo đánh thức dGPU.
+File `system.rs` của bạn nhìn chung **rất ổn và đẹp**. Cách bạn dùng `allocate_ui_with_layout` kết hợp với `set_min_width`/`set_max_width` để ép các block UI nằm ngay ngắn cạnh nhau là một pattern rất chuẩn mực và "pro" khi làm việc với `egui` để tạo Dashboard.
 
-Có 3 con đường để ứng dụng Rust của bạn lấy dữ liệu này trên Windows:
+Tuy nhiên, nếu soi kỹ dưới lăng kính tối ưu hiệu năng (đặc biệt cho một UI có thể render ở 60 FPS hoặc 120 FPS), hàm `draw_timeline_chart` của bạn đang bị dính **vấn đề "âm thầm" ngốn RAM (Heap Allocation)**.
 
-**Cách 1: Đọc qua Windows Performance Data Helper (PDH)**
-* **Ưu điểm:** Native API, không cần quyền Admin sâu, cực nhẹ (bạn đã có sẵn code PDH ở file `query_pdh_gpu`).
-* **Nhược điểm:** Không phải mainboard/máy tính nào cũng expose nhiệt độ CPU/SSD lên PDH.
-* **Target:** `\Thermal Zone Information(*)\Temperature`.
+Dưới đây là một vài tinh chỉnh để file này đạt mức hoàn hảo:
 
-**Cách 2: Đọc qua WMI (Windows Management Instrumentation)**
-* **Ưu điểm:** Chuẩn của Windows, có thể lấy được qua API `MSAcpi_ThermalZoneTemperature` hoặc namespace của nhà sản xuất (như Razer/Dell/Lenovo).
-* **Nhược điểm:** Query WMI bằng Rust đôi khi hơi cồng kềnh (có thể dùng crate `wmi`), và một số máy trả về nhiệt độ theo đơn vị 1/10 Kelvin.
+### 1. Sát thủ cấp phát bộ nhớ (Heap Allocation) trong vòng lặp Render
+Hãy nhìn vào đoạn này:
+```rust
+let gpus:  Vec<f64> = history.iter().map(|s| s.gpu_pct).collect();
+let vrams: Vec<f64> = history.iter().map(|s| s.vram_pct).collect();
+let temps: Vec<f64> = history.iter().map(|s| s.temp_c).collect();
+let pwrs:  Vec<f64> = history.iter().map(|s| s.power_w * (100.0 / 200.0)).collect();
+```
+UI của `egui` có thể được vẽ lại hàng chục lần mỗi giây. Ở mỗi frame, bạn đang ép chương trình `collect()` tạo ra **4 cái `Vec<f64>` mới trên Heap**, sau đó ném chúng vào closure `draw_line` chỉ để `iter()` qua chúng một lần nữa tạo thành `Vec<Pos2>`, rồi lập tức vứt 4 cái `Vec` đầu tiên đi.
 
-**Cách 3: Đọc trực tiếp từ thanh ghi phần cứng (Cách các app Pro như HWiNFO, LibreHardwareMonitor làm)**
-* **Ưu điểm:** Đọc được chính xác đến từng core CPU, lấy được cả nhiệt độ SSD (SMART), cực kỳ chi tiết.
-* **Nhược điểm:** Cần cài một driver Ring0 (như `WinRing0.sys` hoặc `inpoutx64.sys`) để có quyền chọc vào phần cứng. Với một tool cá nhân, việc tự maintain cái này bằng Rust rất cực.
+**Cách Fix:** Sử dụng **Iterator trực tiếp** thay vì `Slice`. Rust sinh ra Iterator chính là để giải quyết bài toán "Zero-cost Abstraction" này. Bạn truyền thẳng iterator vào closure `draw_line` để bỏ hoàn toàn 4 cú cấp phát thừa thãi.
+
+### 2. Redundant Math (Toán học thừa)
+Chỗ vẽ TGP line:
+```rust
+let tgp_frac = (tgp_limit_w * (100.0 / 200.0) / 100.0).clamp(0.0, 1.0) as f32;
+```
+Toán học cơ bản: `x * 0.5 / 100` tương đương với `x / 200`. Bạn có thể rút gọn lại cho code thanh thoát.
 
 ---
 
-### 3. Đề xuất Kiến trúc cho `razer-daemon` của bạn
+### Bản Revise `draw_timeline_chart` tối ưu hoàn toàn
 
-Để ứng dụng của bạn chuyên nghiệp như các công cụ của bên thứ 3 (và giữ pin laptop trâu nhất có thể), hãy kết hợp **Gatekeeper** (ở bài trước) với thư viện hệ thống:
-
-1. **Với dGPU:**
-   * Dùng cái Gatekeeper VRAM (> 256MB) làm chốt chặn. 
-   * Nếu Gatekeeper đóng (dGPU ngủ): Trả về `temp_c = 0`. Giao diện hiện chữ "Zzz" hoặc "Offline".
-   * Nếu Gatekeeper mở (dGPU thức): Gọi `nvidia-smi` để lấy temp chuẩn.
-2. **Với CPU/SSD/RAM:**
-   * Thay vì tự code lại từ đầu, bạn có thể dùng crate [sysinfo](https://github.com/GuillaumeGomez/sysinfo) của Rust. Nó hỗ trợ Windows khá tốt trong việc lấy nhiệt độ CPU thông qua các sensor phổ thông mà không đụng chạm đến dGPU.
-   * Ví dụ:
-     ```rust
-     use sysinfo::{System, SystemExt, ComponentExt};
-     
-     let mut sys = System::new_all();
-     sys.refresh_components();
-     
-     for component in sys.components() {
-         if component.label().contains("CPU") {
-             println!("{} temp: {}°C", component.label(), component.temperature());
-         }
-     }
-     ```
-
-File `poll.rs` của bạn có cấu trúc luồng (thread), channels và cơ chế đánh thức (wake early) rất chuẩn. Tuy nhiên, nếu bạn đang nhắm tới một app **"Zero Overhead"** để tiết kiệm pin tối đa cho laptop, thì file này đang chứa một **"Sát thủ ngầm" tàn phá CPU C-states**.
-
-Dưới đây là review chi tiết và cách tinh chỉnh để phần nền của GUI chạy nhẹ như một chiếc lông hồng.
-
-### 1. Sát thủ ngầm: Query Static Data trong vòng lặp (Critical)
-
-Hãy nhìn vào hàm `collect_sys()` của bạn, nó được gọi mỗi 3 giây trong `do_poll()`:
+Bạn chỉ cần thay thế hàm `draw_timeline_chart` bằng đoạn code sau. Giao diện biểu đồ không đổi 1 pixel, nhưng nó sẽ nhẹ hơn rất nhiều ở phía backend:
 
 ```rust
-const BIOS_KEY: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
-let laptop_model = reg_read_sz(BIOS_KEY, "SystemProductName");
-let bios_version = reg_read_sz(BIOS_KEY, "BIOSVersion");
-let bios_date    = reg_read_sz(BIOS_KEY, "BIOSReleaseDate");
+pub fn draw_timeline_chart(
+    ui: &mut Ui,
+    _id: &str,
+    history: &VecDeque<Sample>,
+    tgp_limit_w: f64,
+    height: f32,
+) {
+    let n = history.len();
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), height),
+        Sense::hover(),
+    );
+    let p = ui.painter();
 
-let cpu_name  = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default();
-let host_name = System::host_name().unwrap_or_default();
-let os_name   = System::long_os_version().unwrap_or_default();
-```
+    // Background.
+    p.rect_filled(rect, egui::Rounding::same(10.0), CHART_BG);
+    p.rect_stroke(rect, egui::Rounding::same(10.0), Stroke::new(1.0, BORDER));
 
-**Vấn đề:** Bạn đang thực hiện **3 lệnh đọc Registry Windows** và hàng loạt phép parse string của `sysinfo` (OS name, CPU name, Hostname) **mỗi 3 giây**. 
-Những thông số này (Tên máy, tên CPU, BIOS) là **Dữ liệu tĩnh (Static Data)** — nó không bao giờ thay đổi trong suốt vòng đời app chạy. Việc liên tục chọc ngoáy vào Registry và gọi OS API mỗi 3 giây sẽ ngăn CPU của bạn rơi vào trạng thái ngủ sâu (C8/C10 state), làm tăng nhiệt độ và ngốn pin vô ích.
-
-**Cách Fix:** Sử dụng `std::sync::OnceLock` (Rust 1.70+) để cache dữ liệu tĩnh này ngay lần đầu tiên gọi, và tái sử dụng nó vĩnh viễn.
-
-### 2. Tối ưu Memory Refresh của `sysinfo`
-
-```rust
-.with_memory(MemoryRefreshKind::everything())
-```
-Hàm `everything()` của `sysinfo` sẽ query cả dung lượng Swap/Pagefile. Trên Windows, đọc Pagefile có thể sinh ra I/O disk request siêu nhỏ. Vì bạn chỉ cần `ram_used_mb` và `ram_total_mb`, hãy đổi thành:
-`.with_memory(MemoryRefreshKind::new().with_ram())`
-
-### 3. Vấn đề IPC Chatty (Kiến trúc)
-Trong `do_poll()`, bạn gọi hàm `send()` khoảng **18 lần** (1 lần lấy tên, 6 lần x2 cho AC/BAT, 5 lần lấy BHO/Fn/Sync...).
-Mặc dù IPC qua local socket khá nhanh, nhưng việc ping-pong 18 lần mỗi 3 giây tốn khá nhiều context-switch của OS. 
-* *Lời khuyên (Không ép buộc phải sửa ngay):* Ở version sau, bạn nên gom tất cả API này thành một lệnh duy nhất ở daemon, ví dụ: `comms::DaemonCommand::GetAllStatus`, daemon gom 1 cục struct bự ném về cho GUI. Code GUI sẽ sạch và nhanh hơn gấp chục lần.
-
----
-
-### Bản Revise `poll.rs` Tối ưu
-
-Đây là đoạn code đã được tinh chỉnh lại với `OnceLock` và tối ưu `sysinfo`. Bạn thay thế phần từ đầu đến hàm `collect_sys()` bằng đoạn này:
-
-```rust
-/// Background poll thread and IPC send helper.
-
-use crate::app::{PollData, SysMetrics, SysStatic};
-use crate::app::{GpuInfo, Pwr};
-use crate::comms;
-use std::sync::{mpsc, OnceLock};
-use std::time::Duration;
-
-// Persistent sysinfo System — kept alive across polls so CPU usage delta works.
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-
-lazy_static::lazy_static! {
-    static ref SYS: std::sync::Mutex<System> = {
-        let s = System::new_with_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-                // Tweak: Chỉ refresh RAM vật lý, bỏ qua Swap/Pagefile để tránh disk I/O wakeup
-                .with_memory(MemoryRefreshKind::new().with_ram()),
+    if n < 2 {
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Waiting for data…",
+            egui::FontId::proportional(11.5),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 80),
         );
-        std::sync::Mutex::new(s)
-    };
-}
+        return;
+    }
 
-// ── Windows registry helper ───────────────────────────────────────────────────
+    let pad_l = 24.0_f32;
+    let pad_r = 54.0_f32;
+    let pad_t = 10.0_f32;
+    let pad_b = 24.0_f32;
+    let cw = rect.width() - pad_l - pad_r;
+    let ch = rect.height() - pad_t - pad_b;
+    let plot_x0 = rect.min.x + pad_l;
+    let plot_y0 = rect.min.y + pad_t;
 
-#[cfg(target_os = "windows")]
-fn reg_read_sz(subkey: &str, value: &str) -> String {
-    use windows::core::HSTRING;
-    use windows::Win32::System::Registry::{
-        RegGetValueW, HKEY_LOCAL_MACHINE,
-        RRF_RT_REG_SZ,
-    };
-    let key = HSTRING::from(subkey);
-    let val = HSTRING::from(value);
-    let mut buf = [0u16; 256];
-    let mut len = (buf.len() * 2) as u32;
-    unsafe {
-        let ret = RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            &key,
-            &val,
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut len),
+    // Grid lines (5 horizontal = 0%, 25%, 50%, 75%, 100%).
+    for i in 0..=4 {
+        let frac = i as f32 / 4.0;
+        let gy = plot_y0 + ch * frac;
+        p.line_segment(
+            [pos2(plot_x0, gy), pos2(plot_x0 + cw, gy)],
+            Stroke::new(if i == 0 || i == 4 { 1.0 } else { 0.5 }, BORDER),
         );
-        if ret.is_ok() {
-            let chars = (len / 2).saturating_sub(1) as usize;
-            String::from_utf16_lossy(&buf[..chars.min(buf.len())])
-        } else {
-            String::new()
+    }
+
+    // Y-axis labels
+    let fs = 9.5_f32;
+    for i in 0..=4 {
+        let val = (4 - i) * 25;   // 100, 75, 50, 25, 0
+        let watts = val * 2;       // 200, 150, 100, 50, 0
+        let gy = plot_y0 + ch * (i as f32 / 4.0) + fs * 0.36;
+
+        p.text(
+            pos2(rect.min.x + 2.0, gy),
+            egui::Align2::LEFT_CENTER,
+            format!("{val}°"),
+            egui::FontId::proportional(fs),
+            Color32::from_rgba_unmultiplied(255, 150, 80, 200),
+        );
+        p.text(
+            pos2(rect.max.x - 4.0, gy),
+            egui::Align2::RIGHT_CENTER,
+            format!("{watts}W"),
+            egui::FontId::proportional(fs),
+            Color32::from_rgba_unmultiplied(80, 200, 255, 180),
+        );
+    }
+
+    let x_step = cw / (n - 1).max(1) as f32;
+
+    // TWEAK: Nhận thẳng Iterator thay vì slice &[f64] để loại bỏ cấp phát Vec<f64>
+    let draw_line = |painter: &egui::Painter, val_iter: impl Iterator<Item = f64>, color: Color32| {
+        let pts: Vec<Pos2> = val_iter
+            .enumerate()
+            .map(|(i, v)| {
+                let x = plot_x0 + i as f32 * x_step;
+                let y = plot_y0 + ch * (1.0 - (v / 100.0).clamp(0.0, 1.0) as f32);
+                pos2(x, y)
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+    };
+
+    let has_temp  = history.iter().any(|s| s.temp_c > 0.0);
+    let has_power = history.iter().any(|s| s.power_w > 0.0);
+
+    // Draw lines (order = back → front) - Map trực tiếp từ history
+    if has_power {
+        draw_line(p, history.iter().map(|s| s.power_w * 0.5), CH_POWER);
+    }
+    if has_temp {
+        draw_line(p, history.iter().map(|s| s.temp_c), CH_TEMP);
+    }
+    draw_line(p, history.iter().map(|s| s.vram_pct), CH_VRAM);
+    draw_line(p, history.iter().map(|s| s.gpu_pct), CH_GPU);
+
+    // TGP limit — dashed reference
+    if tgp_limit_w > 0.0 {
+        // TWEAK: Rút gọn toán học
+        let tgp_frac = (tgp_limit_w / 200.0).clamp(0.0, 1.0) as f32;
+        let tgp_y = plot_y0 + ch * (1.0 - tgp_frac);
+        let dash_col = Color32::from_rgba_unmultiplied(CH_POWER.r(), CH_POWER.g(), CH_POWER.b(), 90);
+        let dash_len = 6.0_f32;
+        let gap_len  = 5.0_f32;
+        let mut x = plot_x0;
+        
+        while x < plot_x0 + cw {
+            let x_end = (x + dash_len).min(plot_x0 + cw);
+            p.line_segment([pos2(x, tgp_y), pos2(x_end, tgp_y)], Stroke::new(1.5, dash_col));
+            x += dash_len + gap_len;
         }
+        
+        let tgp_label_y = (tgp_y - 9.0).max(rect.min.y + pad_t + 1.0);
+        p.text(
+            pos2(plot_x0 + 3.0, tgp_label_y),
+            egui::Align2::LEFT_CENTER,
+            format!("TGP {:.0}W", tgp_limit_w),
+            egui::FontId::proportional(fs * 0.85),
+            Color32::from_rgba_unmultiplied(CH_POWER.r(), CH_POWER.g(), CH_POWER.b(), 160),
+        );
+    }
+
+    // Legend
+    let legend_items: &[(&str, Color32)] = &[
+        ("Temp",  CH_TEMP),
+        ("GPU%",  CH_GPU),
+        ("VRAM%", CH_VRAM),
+        ("Power", CH_POWER),
+    ];
+    let n_leg = legend_items.len() as f32;
+    let leg_step = cw / n_leg;
+    let leg_y = rect.max.y - 10.0;
+    let box_sz = 7.0_f32;
+    
+    for (idx, (label, color)) in legend_items.iter().enumerate() {
+        let lx = plot_x0 + idx as f32 * leg_step + (leg_step / 2.0 - 22.0);
+        p.rect_filled(
+            egui::Rect::from_min_size(pos2(lx, leg_y - box_sz + 1.0), vec2(box_sz, box_sz)),
+            egui::Rounding::same(1.0),
+            *color,
+        );
+        p.text(
+            pos2(lx + box_sz + 3.0, leg_y),
+            egui::Align2::LEFT_BOTTOM,
+            *label,
+            egui::FontId::proportional(fs),
+            *color,
+        );
     }
 }
-
-#[cfg(not(target_os = "windows"))]
-fn reg_read_sz(_subkey: &str, _value: &str) -> String { String::new() }
-
-// Tweak: Cache các dữ liệu tĩnh (Static Data) để không bao giờ phải đọc Registry 
-// hay query OS config trong vòng lặp 3 giây.
-static STATIC_SYS_INFO: OnceLock<SysStatic> = OnceLock::new();
-
-fn get_sys_static(sys: &System) -> SysStatic {
-    STATIC_SYS_INFO.get_or_init(|| {
-        const BIOS_KEY: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
-        let laptop_model = reg_read_sz(BIOS_KEY, "SystemProductName");
-        let bios_version = reg_read_sz(BIOS_KEY, "BIOSVersion");
-        let bios_date    = reg_read_sz(BIOS_KEY, "BIOSReleaseDate");
-
-        let cpu_name  = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default();
-        let host_name = System::host_name().unwrap_or_default();
-        let os_name   = System::long_os_version().unwrap_or_default();
-        
-        SysStatic {
-            cpu_name,
-            host_name,
-            os_name,
-            laptop_model,
-            bios_version,
-            bios_date,
-            uptime_secs: 0, // Sẽ được update liên tục bên ngoài
-        }
-    }).clone()
-}
-
-fn collect_sys() -> (SysMetrics, SysStatic) {
-    let mut sys = SYS.lock().unwrap_or_else(|e| e.into_inner());
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
-
-    let cpu_pct      = sys.global_cpu_usage();
-    let ram_used_mb  = sys.used_memory() / 1024 / 1024;
-    let ram_total_mb = sys.total_memory() / 1024 / 1024;
-    let metrics = SysMetrics { cpu_pct, ram_used_mb, ram_total_mb };
-
-    // Lấy bản clone của static info (cực nhanh vì chỉ copy string)
-    let mut statics = get_sys_static(&sys);
-    // Uptime là thông số động duy nhất cần update
-    statics.uptime_secs = System::uptime(); 
-
-    (metrics, statics)
-}
 ```
 
-Các phần phía dưới (như `send()`, `poll_pwr_slot`, `do_poll` và `start_poll_thread`) của bạn đã viết rất gọn gàng và chuẩn chỉ, bạn có thể giữ nguyên không cần thay đổi. Với fix này, background thread của bạn sẽ trở thành một "ninja" thực thụ — hoạt động hiệu quả mà không để lại gánh nặng cho CPU.
+Các phần còn lại của file như cấu trúc Tile, Checkbox Autostart hay Uptime formatting đều chuẩn logic và bắt đúng behavior mong muốn rồi, bạn không cần phải sửa thêm gì ở chúng cả!

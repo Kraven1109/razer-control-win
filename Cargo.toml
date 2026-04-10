@@ -32,7 +32,7 @@ log        = "0.4"
 env_logger = "0.11"
 rand       = "0.8"
 lazy_static = "1.4"
-sysinfo    = { version = "0.31", default-features = false, features = ["system", "component"] }
+sysinfo    = { version = "0.31", default-features = false, features = ["system"] }
 ctrlc      = { version = "3", features = ["termination"] }
 eframe     = { version = "0.29", features = ["default_fonts"] }
 resvg      = "0.47"
@@ -50,4 +50,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",       # Keyboard hooks for Gaming Mode
     "Win32_UI_Input_KeyboardAndMouse",    # VK_ constants for key blocking
     "Win32_Graphics_Gdi",                 # Display settings for refresh rate switching
+    "Win32_Storage_FileSystem",           # CreateFileW for NVMe temperature IOCTL
+    "Win32_Security",                     # Required by CreateFileW signature
+    "Win32_System_IO",                    # DeviceIoControl
 ] }
