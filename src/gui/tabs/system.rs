@@ -368,19 +368,17 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                                     _ => metric_tile(ui, "RAM", fmt_mb(ram_used_mb), ram_sub.clone(), ram_col),
                                 }
                             });
-                            // ── Thermal row (CPU package temp; shown always, "--" if sensor unavailable) ──
+                            // ── Thermal + Fan row (CPU temp always shown; Fan only when available) ──
                             let cpu_temp_c = app.sys.cpu_temp_c;
                             let cpu_temp_str = if cpu_temp_c > 0.0 { format!("{:.0} °C", cpu_temp_c) } else { "--".to_string() };
+                            let tile_count = 1 + has_fan as usize;
                             ui.add_space(SPC);
-                            draw_tile_row(ui, 1, TILE_H, SPC, |ui, _| {
-                                metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP);
+                            draw_tile_row(ui, tile_count, TILE_H, SPC, |ui, tile_idx| {
+                                match tile_idx {
+                                    0 => metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP),
+                                    _ => metric_tile(ui, "Fan", format!("{} RPM", fan_rpm), "Razer EC", DIM),
+                                }
                             });
-                            if has_fan {
-                                ui.add_space(SPC);
-                                draw_tile_row(ui, 1, TILE_H, SPC, |ui, _| {
-                                    metric_tile(ui, "Fan", format!("{} RPM", fan_rpm), "Razer EC", DIM);
-                                });
-                            }
                         });
                     });
                 });
