@@ -91,39 +91,37 @@ pub fn draw_timeline_chart(
 
     let x_step = cw / (n - 1).max(1) as f32;
 
-    // Helper: draw a polyline for one metric.
-    let draw_line = |painter: &egui::Painter, vals: &[f64], max_val: f64, color: Color32| {
-        let pts: Vec<Pos2> = vals.iter().enumerate().map(|(i, &v)| {
-            let x = plot_x0 + i as f32 * x_step;
-            let y = plot_y0 + ch * (1.0 - (v / max_val.max(1.0)).clamp(0.0, 1.0) as f32);
-            pos2(x, y)
-        }).collect();
+    // Helper: draw a polyline for one metric.  Accepts an iterator directly so
+    // no intermediate Vec<f64> is allocated (4 allocations eliminated per frame).
+    let draw_line = |painter: &egui::Painter, val_iter: &mut dyn Iterator<Item = f64>, color: Color32| {
+        let pts: Vec<Pos2> = val_iter
+            .enumerate()
+            .map(|(i, v)| {
+                let x = plot_x0 + i as f32 * x_step;
+                // All series are already normalised to 0-100 %.
+                let y = plot_y0 + ch * (1.0 - (v / 100.0).clamp(0.0, 1.0) as f32);
+                pos2(x, y)
+            })
+            .collect();
         painter.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
     };
 
-    // Collect data.
-    let gpus:  Vec<f64> = history.iter().map(|s| s.gpu_pct).collect();
-    let vrams: Vec<f64> = history.iter().map(|s| s.vram_pct).collect();
-    let temps: Vec<f64> = history.iter().map(|s| s.temp_c).collect();
-    // Power scaled to 0-200W → 0-100 % for plotting on same axis.
-    let pwrs:  Vec<f64> = history.iter().map(|s| s.power_w * (100.0 / 200.0)).collect();
+    let has_temp  = history.iter().any(|s| s.temp_c  > 0.0);
+    let has_power = history.iter().any(|s| s.power_w > 0.0);
 
-    let has_temp  = temps.iter().any(|&v| v > 0.0);
-    let has_power = pwrs.iter().any(|&v| v > 0.0);
-
-    // Draw lines (order = back → front).
+    // Draw lines (order = back → front) — stream directly from history.
     if has_power {
-        draw_line(p, &pwrs,  100.0, CH_POWER);
+        draw_line(p, &mut history.iter().map(|s| s.power_w * 0.5), CH_POWER);
     }
     if has_temp {
-        draw_line(p, &temps, 100.0, CH_TEMP);
+        draw_line(p, &mut history.iter().map(|s| s.temp_c), CH_TEMP);
     }
-    draw_line(p, &vrams, 100.0, CH_VRAM);
-    draw_line(p, &gpus,  100.0, CH_GPU);
+    draw_line(p, &mut history.iter().map(|s| s.vram_pct), CH_VRAM);
+    draw_line(p, &mut history.iter().map(|s| s.gpu_pct),  CH_GPU);
 
     // TGP limit — dashed reference (same as Linux version).
     if tgp_limit_w > 0.0 {
-        let tgp_frac = (tgp_limit_w * (100.0 / 200.0) / 100.0).clamp(0.0, 1.0) as f32;
+        let tgp_frac = (tgp_limit_w / 200.0).clamp(0.0, 1.0) as f32;
         let tgp_y = plot_y0 + ch * (1.0 - tgp_frac);
         let dash_col = Color32::from_rgba_unmultiplied(CH_POWER.r(), CH_POWER.g(), CH_POWER.b(), 90);
         let dash_len = 6.0_f32;
@@ -172,6 +170,7 @@ pub fn draw_timeline_chart(
         );
     }
 }
+
 
 fn draw_tile_row(
     ui: &mut Ui,
@@ -369,26 +368,13 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                                     _ => metric_tile(ui, "RAM", fmt_mb(ram_used_mb), ram_sub.clone(), ram_col),
                                 }
                             });
-                            // ── Thermal row ─────────────────────────────────
+                            // ── Thermal row (CPU package temp; shown always, "--" if sensor unavailable) ──
                             let cpu_temp_c = app.sys.cpu_temp_c;
-                            let ssd_temp_c = app.sys.ssd_temp_c;
-                            let has_cpu_temp = cpu_temp_c > 0.0;
-                            let has_ssd_temp = ssd_temp_c > 0.0;
-                            if has_cpu_temp || has_ssd_temp {
-                                let tile_count = (has_cpu_temp as usize) + (has_ssd_temp as usize);
-                                let cpu_temp_str = format!("{:.0} °C", cpu_temp_c);
-                                let ssd_temp_str = format!("{:.0} °C", ssd_temp_c);
-                                ui.add_space(SPC);
-                                draw_tile_row(ui, tile_count, TILE_H, SPC, |ui, tile_idx| {
-                                    let cpu_slot = if has_cpu_temp { Some(0usize) } else { None };
-                                    let ssd_slot = if has_ssd_temp { Some(has_cpu_temp as usize) } else { None };
-                                    if Some(tile_idx) == cpu_slot {
-                                        metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP);
-                                    } else if Some(tile_idx) == ssd_slot {
-                                        metric_tile(ui, "SSD Temp", ssd_temp_str.clone(), "NVMe sensor", CH_POWER);
-                                    }
-                                });
-                            }
+                            let cpu_temp_str = if cpu_temp_c > 0.0 { format!("{:.0} °C", cpu_temp_c) } else { "--".to_string() };
+                            ui.add_space(SPC);
+                            draw_tile_row(ui, 1, TILE_H, SPC, |ui, _| {
+                                metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP);
+                            });
                             if has_fan {
                                 ui.add_space(SPC);
                                 draw_tile_row(ui, 1, TILE_H, SPC, |ui, _| {

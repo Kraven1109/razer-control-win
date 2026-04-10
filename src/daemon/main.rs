@@ -29,6 +29,7 @@ mod gaming_mode;
 mod gpu;
 mod kbd;
 mod power;
+mod temps;
 
 use kbd::Effect;
 
@@ -337,6 +338,10 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                 Some(comms::DaemonResponse::SetBatteryHealthOptimizer {
                     result: d.set_bho_handler(is_on, threshold),
                 })
+            }
+            comms::DaemonCommand::GetSysTemps => {
+                let (cpu_temp_c, _) = temps::query_sys_temps();
+                Some(comms::DaemonResponse::GetSysTemps { cpu_temp_c })
             }
             comms::DaemonCommand::GetBatteryHealthOptimizer() => {
                 let (is_on, threshold) = d

@@ -10,14 +10,6 @@
 
 #![windows_subsystem = "windows"]
 
-// Tell NVIDIA Optimus and AMD PowerXpress to use the integrated GPU for this
-// application. Without these exports the driver may assign the discrete GPU
-// as the render device, keeping it from entering D3 sleep (~15-20 W idle).
-#[no_mangle]
-pub static NvOptimusEnablement: i32 = 0;
-#[no_mangle]
-pub static AmdPowerXpressRequestHighPerformance: i32 = 0;
-
 #[path = "../comms.rs"]
 mod comms;
 

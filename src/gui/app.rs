@@ -193,8 +193,6 @@ pub struct SysMetrics {
     pub ram_total_mb: u64,
     /// CPU package temperature in °C, 0.0 when the sensor is unavailable.
     pub cpu_temp_c:   f32,
-    /// NVMe / SSD primary temperature in °C, 0.0 when unavailable.
-    pub ssd_temp_c:   f32,
 }
 
 // ── System static info (collected once) ───────────────────────────────────────
