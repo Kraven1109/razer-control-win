@@ -2,7 +2,7 @@
 
 use crate::app::{App, GpuInfo, Sample};
 use crate::constants::*;
-use crate::widgets::{card, card_inner, chip, draw_page_header, metric_tile};
+use crate::widgets::{card, card_inner, chip, draw_page_header, metric_tile, row as info_row};
 use eframe::egui::{
     self, pos2, vec2, Color32, Pos2, RichText, Sense, Stroke, Ui,
 };
@@ -113,19 +113,19 @@ pub fn draw_timeline_chart(
 
     // Draw lines (order = back → front).
     if has_power {
-        draw_line(p, &pwrs,  100.0, Color32::from_rgb(80, 200, 255));  // cyan
+        draw_line(p, &pwrs,  100.0, CH_POWER);
     }
     if has_temp {
-        draw_line(p, &temps, 100.0, Color32::from_rgb(255, 147, 79));  // orange
+        draw_line(p, &temps, 100.0, CH_TEMP);
     }
-    draw_line(p, &vrams, 100.0, Color32::from_rgb(199, 114, 255));     // purple
-    draw_line(p, &gpus,  100.0, Color32::from_rgb(68,  255, 161));     // green
+    draw_line(p, &vrams, 100.0, CH_VRAM);
+    draw_line(p, &gpus,  100.0, CH_GPU);
 
     // TGP limit — dashed reference (same as Linux version).
     if tgp_limit_w > 0.0 {
         let tgp_frac = (tgp_limit_w * (100.0 / 200.0) / 100.0).clamp(0.0, 1.0) as f32;
         let tgp_y = plot_y0 + ch * (1.0 - tgp_frac);
-        let dash_col = Color32::from_rgba_unmultiplied(80, 200, 255, 90);
+        let dash_col = Color32::from_rgba_unmultiplied(CH_POWER.r(), CH_POWER.g(), CH_POWER.b(), 90);
         let dash_len = 6.0_f32;
         let gap_len  = 5.0_f32;
         let mut x = plot_x0;
@@ -141,16 +141,16 @@ pub fn draw_timeline_chart(
             egui::Align2::LEFT_CENTER,
             format!("TGP {:.0}W", tgp_limit_w),
             egui::FontId::proportional(fs * 0.85),
-            Color32::from_rgba_unmultiplied(80, 200, 255, 160),
+            Color32::from_rgba_unmultiplied(CH_POWER.r(), CH_POWER.g(), CH_POWER.b(), 160),
         );
     }
 
     // Legend — 4 items evenly spaced at the bottom.
     let legend_items: &[(&str, Color32)] = &[
-        ("Temp",  Color32::from_rgb(255, 147, 79)),
-        ("GPU%",  Color32::from_rgb(68,  255, 161)),
-        ("VRAM%", Color32::from_rgb(199, 114, 255)),
-        ("Power", Color32::from_rgb(80,  200, 255)),
+        ("Temp",  CH_TEMP),
+        ("GPU%",  CH_GPU),
+        ("VRAM%", CH_VRAM),
+        ("Power", CH_POWER),
     ];
     let n_leg = legend_items.len() as f32;
     let leg_step = cw / n_leg;
@@ -282,17 +282,20 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                             draw_tile_row(ui, 3, TILE_H, SPC, |ui, tile_idx| {
                                 match tile_idx {
                                     0 => {
-                                        metric_tile(ui, "GPU", format!("{}%", gpu_util), "Utilization", ACCENT);
+                                        metric_tile(ui, "GPU", format!("{}%", gpu_util), "Utilization", CH_GPU);
                                     }
                                     1 => {
                                         if has_temp {
-                                            metric_tile(ui, "Temp", format!("{} °C", gpu_temp), "Sensor", tc);
+                                            // Accent matches the chart line; a faint background tint
+                                            // still signals hot/warm/ok via the tile border shade.
+                                            let _ = tc; // kept for future border tint use
+                                            metric_tile(ui, "Temp", format!("{} °C", gpu_temp), "Sensor", CH_TEMP);
                                         } else {
                                             metric_tile(ui, "Temp", "--", "No sensor", SOFT);
                                         }
                                     }
                                     _ => {
-                                        metric_tile(ui, "VRAM", vram_label.clone(), vram_sub.clone(), ACCENT_2);
+                                        metric_tile(ui, "VRAM", vram_label.clone(), vram_sub.clone(), CH_VRAM);
                                     }
                                 }
                             });
@@ -310,7 +313,7 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                                                 } else {
                                                     "Power draw".into()
                                                 },
-                                                TEMP,
+                                                CH_POWER,
                                             );
                                         } else {
                                             metric_tile(ui, "TGP", "--", "No telemetry", SOFT);
@@ -366,6 +369,26 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                                     _ => metric_tile(ui, "RAM", fmt_mb(ram_used_mb), ram_sub.clone(), ram_col),
                                 }
                             });
+                            // ── Thermal row ─────────────────────────────────
+                            let cpu_temp_c = app.sys.cpu_temp_c;
+                            let ssd_temp_c = app.sys.ssd_temp_c;
+                            let has_cpu_temp = cpu_temp_c > 0.0;
+                            let has_ssd_temp = ssd_temp_c > 0.0;
+                            if has_cpu_temp || has_ssd_temp {
+                                let tile_count = (has_cpu_temp as usize) + (has_ssd_temp as usize);
+                                let cpu_temp_str = format!("{:.0} °C", cpu_temp_c);
+                                let ssd_temp_str = format!("{:.0} °C", ssd_temp_c);
+                                ui.add_space(SPC);
+                                draw_tile_row(ui, tile_count, TILE_H, SPC, |ui, tile_idx| {
+                                    let cpu_slot = if has_cpu_temp { Some(0usize) } else { None };
+                                    let ssd_slot = if has_ssd_temp { Some(has_cpu_temp as usize) } else { None };
+                                    if Some(tile_idx) == cpu_slot {
+                                        metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP);
+                                    } else if Some(tile_idx) == ssd_slot {
+                                        metric_tile(ui, "SSD Temp", ssd_temp_str.clone(), "NVMe sensor", CH_POWER);
+                                    }
+                                });
+                            }
                             if has_fan {
                                 ui.add_space(SPC);
                                 draw_tile_row(ui, 1, TILE_H, SPC, |ui, _| {
@@ -411,6 +434,33 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
             });
         }
     }
+
+    // ── Startup settings card — always visible regardless of GPU availability ─
+    draw_startup_card(ui);
+}
+
+fn draw_startup_card(ui: &mut Ui) {
+    card(ui, "Startup", "System integration settings", |ui| {
+        ui.set_min_width(ui.available_width());
+
+        let autostart = crate::tray::is_autostart_enabled();
+        info_row(ui, "Start on boot", "Launch GUI minimized to tray on Windows login", |ui| {
+            let mut checked = autostart;
+            if ui.checkbox(&mut checked, "").changed() {
+                crate::tray::toggle_autostart();
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Registers razer-gui.exe in the current user's Run registry key. \
+                 The daemon must be started separately with Administrator privileges \
+                 (e.g. via a Task Scheduler entry set to run elevated at logon).",
+            )
+            .size(11.0)
+            .color(SOFT),
+        );
+    });
 }
 
 fn draw_system_info(ui: &mut Ui, app: &App) {

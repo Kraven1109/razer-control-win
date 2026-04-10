@@ -38,6 +38,21 @@ enum Args {
     Pdl,
     /// Store CPU power limits (informational — RAPL not applied on Windows)
     SetPdl(PdlParams),
+    /// Configure GUI autostart on Windows login (no daemon required)
+    Startup {
+        #[command(subcommand)]
+        action: StartupAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum StartupAction {
+    /// Register razer-gui.exe to launch at Windows login (current user)
+    Enable,
+    /// Remove autostart registry entry
+    Disable,
+    /// Show whether autostart is currently enabled
+    Status,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -276,6 +291,24 @@ struct RippleParams {
 // ── main ───────────────────────────────────────────────────────────────────
 
 fn main() {
+    let cli = Cli::parse();
+
+    // Startup sub-command does not need a running daemon — handle it first.
+    if let Args::Startup { action } = &cli.args {
+        match action {
+            StartupAction::Enable  => autostart_set(true),
+            StartupAction::Disable => autostart_set(false),
+            StartupAction::Status  => {
+                if autostart_is_enabled() {
+                    println!("autostart: enabled");
+                } else {
+                    println!("autostart: disabled");
+                }
+            }
+        }
+        return;
+    }
+
     if !comms::is_daemon_running() {
         eprintln!(
             "Error: cannot connect to daemon on {}.\n\
@@ -284,8 +317,6 @@ fn main() {
         );
         std::process::exit(1);
     }
-
-    let cli = Cli::parse();
 
     match cli.args {
         Args::Read { attr } => match attr {
@@ -361,10 +392,76 @@ fn main() {
         Args::Gpu => read_gpu_status(),
         Args::Pdl => read_power_limits(),
         Args::SetPdl(p) => write_power_limits(p.pl1, p.pl2),
+        // Startup is already handled above before the daemon check.
+        Args::Startup { .. } => unreachable!(),
     }
 }
 
 // ── IPC helpers ────────────────────────────────────────────────────────────
+
+// ── Autostart helpers (registry, no daemon required) ──────────────────────
+
+const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+const APP_NAME: &str = "RazerBladeControl";
+
+#[cfg(windows)]
+fn autostart_is_enabled() -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let key = HSTRING::from(RUN_KEY);
+    let val = HSTRING::from(APP_NAME);
+    let mut buf = [0u16; 512];
+    let mut len = (buf.len() * 2) as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER, &key, &val, RRF_RT_REG_SZ,
+            None, Some(buf.as_mut_ptr().cast()), Some(&mut len),
+        ).is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn autostart_is_enabled() -> bool { false }
+
+#[cfg(windows)]
+fn autostart_set(enable: bool) {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+    };
+    if enable {
+        // Register razer-gui.exe in the same directory as this CLI executable.
+        let gui_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("razer-gui.exe")))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if gui_exe.is_empty() {
+            eprintln!("autostart enable: could not determine razer-gui.exe path");
+            return;
+        }
+        let key = HSTRING::from(RUN_KEY);
+        let val = HSTRING::from(APP_NAME);
+        let mut data: Vec<u16> = gui_exe.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER, &key, &val, REG_SZ.0,
+                Some(data.as_mut_ptr().cast()), (data.len() * 2) as u32,
+            );
+        }
+        println!("autostart: enabled ({})", gui_exe);
+    } else {
+        let key = HSTRING::from(RUN_KEY);
+        let val = HSTRING::from(APP_NAME);
+        unsafe { let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, &key, &val); }
+        println!("autostart: disabled");
+    }
+}
+
+#[cfg(not(windows))]
+fn autostart_set(_enable: bool) {
+    eprintln!("autostart: not supported on this platform");
+}
 
 fn send_data(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     match comms::bind() {
@@ -637,7 +734,7 @@ fn write_fn_swap(swap: bool) {
     match send_data(comms::DaemonCommand::SetFnSwap { swap }) {
         Some(comms::DaemonResponse::SetFnSwap { result: true }) => read_fn_swap(),
         Some(comms::DaemonResponse::SetFnSwap { result: false }) => eprintln!(
-            "Fn swap write was rejected or did not persist on this device"
+            "Fn swap write was rejected or did not persist on this device; Blade 16 (2023) likely uses Synapse's storage plus bladeNative path"
         ),
         _ => eprintln!("Failed to set Fn swap"),
     }

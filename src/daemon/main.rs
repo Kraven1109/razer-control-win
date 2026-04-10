@@ -347,7 +347,7 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
             comms::DaemonCommand::GetDeviceName => {
                 let name = d
                     .get_device()
-                    .map(|l| l.get_name())
+                    .map(|l| l.get_name().to_string())
                     .unwrap_or_else(|| "Unknown".to_string());
                 Some(comms::DaemonResponse::GetDeviceName { name })
             }
@@ -407,7 +407,7 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                     info!("Fn key swap verified at state {}", swap);
                 } else {
                     warn!(
-                        "Fn key swap write did not persist; Blade 16 likely needs the proprietary Synapse path"
+                        "Fn key swap write did not persist; Blade 16 likely uses Synapse's storage plus bladeNative path instead of a standalone hardware toggle"
                     );
                 }
                 Some(comms::DaemonResponse::SetFnSwap { result: ok })

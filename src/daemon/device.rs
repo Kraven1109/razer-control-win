@@ -8,17 +8,24 @@
 
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
-use std::{io, thread, time};
+use std::{io, thread, time::Duration};
 use hidapi::HidApi;
+use lazy_static::lazy_static;
 use log::*;
 
 use crate::config;
 use service::SupportedDevice;
 
 const RAZER_VENDOR_ID: u16 = 0x1532;
+const REPORT_SIZE: usize = 91;
 
 // Embed the device database at compile time — no install step needed.
 static LAPTOPS_JSON: &str = include_str!("../../data/devices/laptops.json");
+
+// Tweak 1: Cache HidApi so it doesn't incur the heavy SetupAPI enumeration cost on re-discovery
+lazy_static! {
+    static ref HID_API: core::result::Result<HidApi, hidapi::HidError> = HidApi::new();
+}
 
 // ── Wire protocol ──────────────────────────────────────────────────────────
 
@@ -59,14 +66,18 @@ impl RazerPacket {
         }
     }
 
-    fn calc_crc(&mut self) -> Vec<u8> {
+    /// Calculates the checksum and returns the strictly serialized payload.
+    fn calc_crc_and_serialize(&mut self) -> Vec<u8> {
         let mut res: u8 = 0x00;
         let buf: Vec<u8> = bincode::serialize(self).unwrap();
         for i in 2..88 {
             res ^= buf[i];
         }
         self.crc = res;
-        buf
+        
+        // Critical Bug Fix: Re-serialize to embed the newly calculated CRC byte 
+        // into the final payload before dispatching.
+        bincode::serialize(self).unwrap()
     }
 }
 
@@ -76,6 +87,7 @@ pub struct DeviceManager {
     pub device: Option<RazerLaptop>,
     supported_devices: Vec<SupportedDevice>,
     pub config: Option<config::Configuration>,
+    fan_overrides: [i32; 2],
 }
 
 impl DeviceManager {
@@ -84,6 +96,7 @@ impl DeviceManager {
             device: None,
             supported_devices: vec![],
             config: None,
+            fan_overrides: [0, 0],
         }
     }
 
@@ -93,7 +106,12 @@ impl DeviceManager {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         info!("Supported devices loaded: {}", res.supported_devices.len());
         match config::Configuration::read_from_config() {
-            Ok(c) => res.config = Some(c),
+            Ok(mut c) => {
+                if c.reset_fan_profiles_to_auto() {
+                    let _ = c.write_to_file();
+                }
+                res.config = Some(c);
+            }
             Err(_) => res.config = Some(config::Configuration::new()),
         }
         Ok(res)
@@ -112,52 +130,48 @@ impl DeviceManager {
     }
 
     pub fn find_supported_device(&mut self, vid: u16, pid: u16) -> Option<&SupportedDevice> {
-        for device in &self.supported_devices {
+        self.supported_devices.iter().find(|device| {
             let svid = u16::from_str_radix(&device.vid, 16).unwrap_or(0);
             let spid = u16::from_str_radix(&device.pid, 16).unwrap_or(0);
-            if svid == vid && spid == pid {
-                return Some(device);
-            }
-        }
-        None
+            svid == vid && spid == pid
+        })
     }
 
     pub fn discover_devices(&mut self) {
-        match HidApi::new() {
+        match &*HID_API {
             Ok(api) => {
-                // Collect all Razer HID interfaces (no interface-number filter).
-                // On Windows the hidapi windows-native backend enumerates every
-                // USB HID interface as a separate entry.  Interface 0 is the
-                // boot-keyboard and has no Feature report descriptor, so
-                // HidD_SetFeature fails there with ERROR_INVALID_FUNCTION.
-                // The Razer proprietary EC control channel is usually interface 2
-                // on Blade laptops, so we sort descending and pick the first
-                // interface that opens successfully.
+                // Filter by Razer vendor ID; collect all interfaces regardless of
+                // usage page because different Razer models place the proprietary
+                // EC control interface on different vendor usage pages.
+                // Sorting descending ensures interface 2 (Razer control) is tried
+                // before interface 1 and 0 (keyboard/consumer).
                 let mut devices: Vec<_> = api
                     .device_list()
                     .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
                     .collect();
 
-                // Log every detected Razer interface for diagnostics.
-                for d in &devices {
-                    debug!(
-                        "Razer HID candidate: PID=0x{:04X} iface={} \
-                         usage_page=0x{:04X} usage=0x{:04X} path={}",
-                        d.product_id(),
-                        d.interface_number(),
-                        d.usage_page(),
-                        d.usage(),
-                        d.path().to_string_lossy()
-                    );
+                if log::log_enabled!(log::Level::Debug) {
+                    for d in &devices {
+                        debug!(
+                            "Razer HID candidate: PID=0x{:04X} iface={} \
+                             usage_page=0x{:04X} usage=0x{:04X} path={}",
+                            d.product_id(),
+                            d.interface_number(),
+                            d.usage_page(),
+                            d.usage(),
+                            d.path().to_string_lossy()
+                        );
+                    }
                 }
 
-                // Sort descending so we try interface 2 (Razer control) before
-                // interface 1 and 0.  Interfaces with number -1 sort last.
-                devices.sort_by(|a, b| b.interface_number().cmp(&a.interface_number()));
+                // Sort descending so interface 2/1 comes before 0.
+                devices.sort_by_key(|d| -(d.interface_number() as i32));
 
                 for device in devices {
                     let result = self
-                        .find_supported_device(device.vendor_id(), device.product_id());
+                        .find_supported_device(device.vendor_id(), device.product_id())
+                        .cloned(); // Clone to drop the immutable borrow on self
+                    
                     if let Some(supported) = result {
                         match api.open_path(device.path()) {
                             Ok(dev) => {
@@ -167,9 +181,9 @@ impl DeviceManager {
                                     device.interface_number()
                                 );
                                 self.device = Some(RazerLaptop::new(
-                                    supported.name.clone(),
-                                    supported.features.clone(),
-                                    supported.fan.clone(),
+                                    supported.name,
+                                    supported.features,
+                                    supported.fan,
                                     dev,
                                 ));
                                 return;
@@ -177,8 +191,7 @@ impl DeviceManager {
                             Err(e) => {
                                 debug!(
                                     "Could not open interface {}: {}",
-                                    device.interface_number(),
-                                    e
+                                    device.interface_number(), e
                                 );
                             }
                         }
@@ -270,10 +283,8 @@ impl DeviceManager {
     }
 
     pub fn set_fan_rpm(&mut self, ac: usize, rpm: i32) -> bool {
-        if let Some(config) = self.get_config() {
-            config.power[ac].fan_rpm = rpm;
-            let _ = config.write_to_file();
-        }
+        let rpm = rpm.max(0);
+        self.fan_overrides[ac.min(1)] = rpm;
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 return laptop.set_fan_rpm(rpm as u16);
@@ -338,13 +349,10 @@ impl DeviceManager {
                 return laptop.get_fan_rpm() as i32;
             }
         }
-        self.get_ac_config(ac).map(|c| c.fan_rpm).unwrap_or(0)
+        self.fan_overrides[ac.min(1)]
     }
 
     pub fn get_power_mode(&mut self, ac: usize) -> u8 {
-        // Always return the config value (in-memory ground truth).
-        // Querying the EC directly is unreliable: the hardware may report
-        // a stale/default value if Synapse or the EC hasn't settled yet.
         self.get_ac_config(ac).map(|c| c.power_mode).unwrap_or(0)
     }
 
@@ -358,17 +366,20 @@ impl DeviceManager {
 
     pub fn set_ac_state(&mut self, online: bool) {
         let ac = online as usize;
+        let override_rpm = self.fan_overrides[ac.min(1)];
         if let Some(laptop) = self.get_device() {
             laptop.set_ac_state(online);
         }
         if let Some(config) = self.get_ac_config(ac) {
             if let Some(laptop) = self.get_device() {
                 laptop.set_config(config);
+                if override_rpm > 0 {
+                    laptop.set_fan_rpm(override_rpm as u16);
+                }
             }
         }
     }
 
-    /// Read AC state from Windows and apply the matching config profile.
     #[allow(dead_code)]
     pub fn set_ac_state_get(&mut self) {
         let online = crate::power::is_on_ac();
@@ -425,18 +436,16 @@ impl DeviceManager {
         }
 
         for _ in 0..3 {
-            thread::sleep(time::Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(40));
             if let Some(current) = laptop.get_fn_swap() {
                 if current == swap {
                     return true;
                 }
             }
         }
-
         false
     }
 
-    /// RAPL not available on Windows — return stored (0,0) values.
     pub fn get_rapl_limits(&mut self, ac: usize) -> (u32, u32) {
         self.get_ac_config(ac)
             .map(|c| (c.rapl_pl1_watts, c.rapl_pl2_watts))
@@ -500,12 +509,14 @@ impl RazerLaptop {
         }
     }
 
-    pub fn get_name(&self) -> String {
-        self.name.clone()
+    // Tweak 6.1: Return &str instead of cloning String
+    pub fn get_name(&self) -> &str {
+        &self.name
     }
 
-    pub fn have_feature(&mut self, fch: String) -> bool {
-        self.features.contains(&fch)
+    // Tweak 1.1: Accepts &str, zero allocation
+    pub fn have_feature(&self, fch: &str) -> bool {
+        self.features.iter().any(|f| f == fch)
     }
 
     #[allow(dead_code)]
@@ -537,24 +548,29 @@ impl RazerLaptop {
         ret
     }
 
-    fn clamp_fan(&mut self, rpm: u16) -> u8 {
-        if rpm > self.fan[1] {
-            return (self.fan[1] / 100) as u8;
+    // Tweak 2.1: Bounds guard to prevent slice panic if JSON lacks limits
+    fn clamp_fan(&self, rpm: u16) -> u8 {
+        if self.fan.len() < 2 {
+            return (rpm / 100) as u8;
         }
-        if rpm < self.fan[0] {
-            return (self.fan[0] / 100) as u8;
+
+        let min = self.fan[0];
+        let max = self.fan[1];
+
+        if rpm > max {
+            return (max / 100) as u8;
+        }
+        if rpm < min {
+            return (min / 100) as u8;
         }
         (rpm / 100) as u8
-    }
-
-    fn clamp_u8(&mut self, value: u8, min: u8, max: u8) -> u8 {
-        value.clamp(min, max)
     }
 
     pub fn set_standard_effect(&mut self, effect_id: u8, params: Vec<u8>) -> bool {
         let mut report = RazerPacket::new(0x03, 0x0a, 80);
         report.args[0] = effect_id;
-        for (idx, &p) in params.iter().enumerate() {
+        // Tweak 7.1: take(79) to prevent out-of-bounds array access
+        for (idx, &p) in params.iter().take(79).enumerate() {
             report.args[idx + 1] = p;
         }
         self.send_report(report).is_some()
@@ -607,7 +623,7 @@ impl RazerLaptop {
     }
 
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
-        if boost == 3 && !self.have_feature("boost".to_string()) {
+        if boost == 3 && !self.have_feature("boost") {
             boost = 2;
         }
         let mut report = RazerPacket::new(0x0d, 0x07, 0x03);
@@ -635,7 +651,7 @@ impl RazerLaptop {
 
     pub fn set_power_mode(&mut self, mode: u8, cpu_boost: u8, gpu_boost: u8) -> bool {
         let mode = mode.min(4);
-        let cpu_boost = if self.have_feature("boost".to_string()) {
+        let cpu_boost = if self.have_feature("boost") {
             cpu_boost.min(3)
         } else {
             cpu_boost.min(2)
@@ -679,7 +695,7 @@ impl RazerLaptop {
         true
     }
 
-    pub fn get_fan_rpm(&mut self) -> u16 {
+    pub fn get_fan_rpm(&self) -> u16 {
         self.fan_rpm as u16 * 100
     }
 
@@ -694,7 +710,8 @@ impl RazerLaptop {
         let mut report = RazerPacket::new(0x03, 0x00, 0x03);
         report.args[0] = RazerLaptop::VARSTORE;
         report.args[1] = RazerLaptop::LOGO_LED;
-        report.args[2] = self.clamp_u8(mode, 0x00, 0x01);
+        // Built-in clamp instead of custom mutable method
+        report.args[2] = mode.clamp(0x00, 0x01);
         self.send_report(report).is_some()
     }
 
@@ -712,7 +729,7 @@ impl RazerLaptop {
     }
 
     pub fn get_bho(&mut self) -> Option<u8> {
-        if !self.have_feature("bho".to_string()) {
+        if !self.have_feature("bho") {
             return None;
         }
         let mut report = RazerPacket::new(0x07, 0x92, 0x01);
@@ -721,7 +738,7 @@ impl RazerLaptop {
     }
 
     pub fn set_bho(&mut self, is_on: bool, threshold: u8) -> bool {
-        if !self.have_feature("bho".to_string()) {
+        if !self.have_feature("bho") {
             warn!("BHO not supported on this device");
             return false;
         }
@@ -734,70 +751,83 @@ impl RazerLaptop {
         })
     }
 
-    /// Get whether Fn key swap is active (true = media keys primary).
     pub fn get_fn_swap(&mut self) -> Option<bool> {
         let mut report = RazerPacket::new(0x02, 0x86, 0x02);
-        report.id = 0xFF; // Fn toggle uses 0xFF per OpenRazer razer_chroma_misc_fn_key_toggle
+        report.id = 0xFF;
         report.args[0] = 0x00;
         self.send_report(report).map(|r| r.args[1] != 0)
     }
 
-    /// Set Fn key swap: false = F-keys primary, true = media keys primary.
     pub fn set_fn_swap(&mut self, swap: bool) -> bool {
         let mut report = RazerPacket::new(0x02, 0x06, 0x02);
-        report.id = 0xFF; // Fn toggle uses 0xFF per OpenRazer razer_chroma_misc_fn_key_toggle
+        report.id = 0xFF;
         report.args[0] = 0x00;
         report.args[1] = swap as u8;
         self.send_report(report).is_some()
     }
 
+    /// Read the EC's feature-report response.
+    /// The 1 ms sleep is the minimum guard that lets the EC finish processing
+    /// the preceding SET_REPORT before we issue a GET_REPORT.  Without it,
+    /// `HidD_GetFeature` returns the stale buffer from the previous command.
+    fn read_response(&self, buf: &mut [u8; REPORT_SIZE]) -> Option<usize> {
+        thread::sleep(Duration::from_millis(1));
+        match self.device.get_feature_report(buf) {
+            Ok(size) if size == REPORT_SIZE => Some(size),
+            _ => None,
+        }
+    }
+
     fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
-        let mut temp_buf: [u8; 91] = [0x00; 91];
+        let mut temp_buf = [0x00; REPORT_SIZE];
+
+        // Serialize ONCE per command to drop heap-allocation overhead during retries
+        let packet_payload = report.calc_crc_and_serialize();
+
         for attempt in 0..3 {
-            match self.device.send_feature_report(report.calc_crc().as_slice()) {
+            match self.device.send_feature_report(&packet_payload) {
                 Ok(_) => {
-                    thread::sleep(time::Duration::from_millis(1));
-                    match self.device.get_feature_report(&mut temp_buf) {
-                        Ok(size) if size == 91 => {
-                            match bincode::deserialize::<RazerPacket>(&temp_buf) {
-                                Ok(response) => {
-                                    if response.command_id == 0x92 {
-                                        return Some(response);
-                                    }
-                                    if response.remaining_packets != report.remaining_packets
-                                        || response.command_class != report.command_class
-                                        || response.command_id != report.command_id
-                                    {
-                                        warn!(
-                                            "HID response mismatch: expected class=0x{:02X} cmd=0x{:02X}",
-                                            report.command_class, report.command_id
-                                        );
-                                    } else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
-                                        return Some(response);
-                                    }
-                                    if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
-                                        warn!(
-                                            "HID command not supported: class=0x{:02X} cmd=0x{:02X}",
-                                            report.command_class, report.command_id
-                                        );
-                                        return None;
-                                    }
+                    if self.read_response(&mut temp_buf).is_some() {
+                        match bincode::deserialize::<RazerPacket>(&temp_buf) {
+                            Ok(response) => {
+                                if response.command_id == 0x92 {
+                                    return Some(response);
                                 }
-                                Err(e) => warn!("HID deserialize (attempt {}): {}", attempt + 1, e),
+                                if response.remaining_packets != report.remaining_packets
+                                    || response.command_class != report.command_class
+                                    || response.command_id != report.command_id
+                                {
+                                    warn!(
+                                        "HID response mismatch: expected class=0x{:02X} cmd=0x{:02X}",
+                                        report.command_class, report.command_id
+                                    );
+                                } else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
+                                    return Some(response);
+                                } else if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
+                                    warn!(
+                                        "HID command not supported: class=0x{:02X} cmd=0x{:02X}",
+                                        report.command_class, report.command_id
+                                    );
+                                    return None;
+                                }
                             }
+                            // Better contextual logging
+                            Err(e) => warn!(
+                                "HID deserialize (attempt {} for class 0x{:02X} cmd 0x{:02X}): {}", 
+                                attempt + 1, report.command_class, report.command_id, e
+                            ),
                         }
-                        Ok(size) => warn!(
-                            "Invalid HID report length: {} (expected 91, attempt {})",
-                            size,
-                            attempt + 1
-                        ),
-                        Err(e) => warn!("HID read (attempt {}): {}", attempt + 1, e),
+                    } else {
+                        warn!("HID read timeout (attempt {})", attempt + 1);
                     }
                 }
                 Err(e) => error!("HID write (attempt {}): {}", attempt + 1, e),
             }
-            thread::sleep(time::Duration::from_millis(5 * (attempt as u64 + 1)));
+            
+            // Tweak: Exponential backoff (1ms, 2ms, 4ms) instead of large fixed steps
+            thread::sleep(Duration::from_millis(1 << attempt));
         }
+        
         error!(
             "HID command failed after 3 attempts: class=0x{:02X} cmd=0x{:02X}",
             report.command_class, report.command_id

@@ -10,6 +10,14 @@
 
 #![windows_subsystem = "windows"]
 
+// Tell NVIDIA Optimus and AMD PowerXpress to use the integrated GPU for this
+// application. Without these exports the driver may assign the discrete GPU
+// as the render device, keeping it from entering D3 sleep (~15-20 W idle).
+#[no_mangle]
+pub static NvOptimusEnablement: i32 = 0;
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 0;
+
 #[path = "../comms.rs"]
 mod comms;
 
@@ -36,7 +44,8 @@ use eframe::egui::{
 /// Window icon rasterized from the bundled SVG at 64×64.
 fn make_icon() -> Arc<egui::viewport::IconData> {
     const SVG: &[u8] = include_bytes!("../../data/razer-blade-control.svg");
-    let options = resvg::usvg::Options::default();
+    let mut options = resvg::usvg::Options::default();
+    Arc::make_mut(&mut options.fontdb).load_system_fonts();
     let tree = resvg::usvg::Tree::from_data(SVG, &options)
         .expect("icon SVG parse failed");
     let size = 64u32;
@@ -58,6 +67,15 @@ fn make_icon() -> Arc<egui::viewport::IconData> {
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
+const NAV_ITEMS: [(&str, &str, Tab); 4] = [
+    ("AC",  "Power",    Tab::Ac),
+    ("BAT", "Battery",  Tab::Battery),
+    ("KBD", "Keyboard", Tab::Keyboard),
+    ("SYS", "System",   Tab::System),
+];
+const BADGE_ACTIVE_ALPHA: u8 = 35;
+const BADGE_IDLE_ALPHA:   u8 = 16;
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Tray menu actions ─────────────────────────────────────────────────
@@ -74,18 +92,16 @@ impl eframe::App for App {
                             2 => (2, 2), // Creator
                             _ => (3, 3), // Silent
                         };
-                        let _ = crate::poll::send(comms::DaemonCommand::SetPowerMode {
-                            ac: 1, pwr: mode, cpu, gpu,
-                        });
-                        let _ = crate::poll::send(comms::DaemonCommand::SetPowerMode {
-                            ac: 0, pwr: mode, cpu, gpu,
-                        });
+                        let send = |ac| comms::DaemonCommand::SetPowerMode { ac, pwr: mode, cpu, gpu };
+                        let _ = crate::poll::send(send(1));
+                        let _ = crate::poll::send(send(0));
                         self.wake_poll();
                     }
                     tray::TrayAction::SetBrightness(pct) => {
                         let val = ((pct as u32 * 255) / 100) as u8;
-                        let _ = crate::poll::send(comms::DaemonCommand::SetBrightness { ac: 1, val });
-                        let _ = crate::poll::send(comms::DaemonCommand::SetBrightness { ac: 0, val });
+                        let send = |ac| comms::DaemonCommand::SetBrightness { ac, val };
+                        let _ = crate::poll::send(send(1));
+                        let _ = crate::poll::send(send(0));
                         self.wake_poll();
                     }
                     tray::TrayAction::ToggleStartOnBoot => {
@@ -107,9 +123,6 @@ impl eframe::App for App {
 
         // ── Detached chart window ─────────────────────────────────────────────
         if self.chart_detached {
-            let chart_history = self.history.clone();
-            let chart_gpu     = self.gpu.clone();
-
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("chart_float"),
                 egui::ViewportBuilder::default()
@@ -143,12 +156,7 @@ impl eframe::App for App {
                                                     )
                                                     .clicked()
                                                 {
-                                                    ctx.data_mut(|d| {
-                                                        d.insert_temp(
-                                                            egui::Id::new("chart_close"),
-                                                            true,
-                                                        );
-                                                    });
+                                                    self.chart_detached = false;
                                                     ctx.send_viewport_cmd(
                                                         egui::ViewportCommand::Close,
                                                     );
@@ -159,22 +167,16 @@ impl eframe::App for App {
                                     ui.add_space(8.0);
                                     tabs::system::draw_charts_only(
                                         ui,
-                                        &chart_history,
-                                        &chart_gpu,
+                                        &self.history,
+                                        &self.gpu,
                                     );
                                 });
                         });
                     if ctx.input(|i| i.viewport().close_requested()) {
-                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("chart_close"), true));
+                        self.chart_detached = false;
                     }
                 },
             );
-
-            // After viewport callback: check if attach-back was requested.
-            if ctx.data(|d| d.get_temp::<bool>(egui::Id::new("chart_close")).unwrap_or(false)) {
-                self.chart_detached = false;
-                ctx.data_mut(|d| d.insert_temp(egui::Id::new("chart_close"), false));
-            }
         }
 
         // ── Sidebar ───────────────────────────────────────────────────────────
@@ -209,12 +211,7 @@ impl eframe::App for App {
                 let btn_w = ui.available_width();
                 const BTN_H: f32 = 44.0;
 
-                for (tag, label, tab) in [
-                    ("AC",  "Power",    Tab::Ac),
-                    ("BAT", "Battery",  Tab::Battery),
-                    ("KBD", "Keyboard", Tab::Keyboard),
-                    ("SYS", "System",   Tab::System),
-                ] {
+                for (tag, label, tab) in NAV_ITEMS {
                     let active  = self.tab == tab;
                     let (rect, resp) =
                         ui.allocate_exact_size(vec2(btn_w, BTN_H), Sense::click());
@@ -248,7 +245,7 @@ impl eframe::App for App {
                     let badge_col = if active { ACCENT } else if hovered { TEXT } else { SOFT };
                     let badge_fill = Color32::from_rgba_unmultiplied(
                         badge_col.r(), badge_col.g(), badge_col.b(),
-                        if active { 35 } else { 16 },
+                        if active { BADGE_ACTIVE_ALPHA } else { BADGE_IDLE_ALPHA },
                     );
                     let b_size = vec2(28.0, 22.0);
                     let b_left = 10.0_f32;
@@ -273,7 +270,7 @@ impl eframe::App for App {
                         text_c,
                     );
 
-                    if hovered { ctx.set_cursor_icon(CursorIcon::PointingHand); }
+                    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
                     if resp.clicked() { self.tab = tab; }
                     ui.add_space(4.0);
                 }
@@ -373,6 +370,10 @@ impl eframe::App for App {
                             });
                     });
             });
+
+        // Schedule next repaint after the poll interval so the window goes idle
+        // between data updates. User interaction wakes the renderer immediately.
+        ctx.request_repaint_after(std::time::Duration::from_secs(3));
     }
 }
 

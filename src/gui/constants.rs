@@ -17,7 +17,15 @@ pub const SOFT: Color32 = Color32::from_rgb(104, 112, 124);
 pub const OK: Color32 = Color32::from_rgb(68, 255, 161);
 pub const WARN: Color32 = Color32::from_rgb(255, 198, 79);
 pub const ERR: Color32 = Color32::from_rgb(255, 107, 107);
-pub const TEMP: Color32 = Color32::from_rgb(255, 160, 82);
+
+// ── Chart line colours (shared between the timeline chart and metric tiles) ───
+//
+// Using the same constants for both means the tile accent colour always matches
+// the line drawn in the history chart for that metric.
+pub const CH_GPU:   Color32 = Color32::from_rgb(68,  255, 161);  // green  – GPU utilization
+pub const CH_TEMP:  Color32 = Color32::from_rgb(255, 147, 79);   // orange – GPU temperature
+pub const CH_VRAM:  Color32 = Color32::from_rgb(199, 114, 255);  // purple – VRAM utilization
+pub const CH_POWER: Color32 = Color32::from_rgb(80,  200, 255);  // cyan   – GPU power (TGP)
 
 // ── Chart / layout constants ──────────────────────────────────────────────────
 

@@ -20,6 +20,8 @@ use log::*;
 
 lazy_static! {
     static ref GPU_STATUS_CACHE: Mutex<Option<GpuStatus>> = Mutex::new(None);
+    /// Cached path to nvidia-smi.exe — resolved once, never re-spawned for discovery.
+    static ref NVIDIA_SMI_PATH: Option<PathBuf> = resolve_nvidia_smi();
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -53,12 +55,65 @@ pub fn get_cached_gpu_status() -> Option<GpuStatus> {
     GPU_STATUS_CACHE.lock().ok().and_then(|g| g.clone())
 }
 
-/// Main query entry point — prefer NVIDIA telemetry, fall back to PDH.
+/// Main query entry point.
+///
+/// Strategy:
+/// 1. Always query PDH first — it reads Windows Performance Counters which are
+///    passive and do **not** prevent the dGPU from entering D3 sleep.
+/// 2. Only call `nvidia-smi` when PDH reports non-trivial GPU activity
+///    (utilization > 0 % or dedicated VRAM usage > 500 MB).  When the GPU is
+///    actually being used it is already awake, so the subprocess overhead is
+///    acceptable and provides accurate power/clock data.
+/// 3. If PDH itself fails, fall back to nvidia-smi unconditionally (degraded
+///    mode — cannot avoid waking the GPU in this rare path).
 pub fn query_gpu() -> Option<GpuStatus> {
-    query_nvidia_smi().or_else(query_pdh_gpu)
+    let pdh = query_pdh_gpu();
+
+    // GATEKEEPER — two passive indicators that the dGPU is awake (D0/D3-Hot):
+    //
+    //  1. Dedicated VRAM > 256 MB: when the dGPU enters D3-Cold the VRAM rail
+    //     is powered off and dedicated usage drops to near zero.  The iGPU only
+    //     exposes ~128 MB dedicated memory, so > 256 MB unambiguously means the
+    //     discrete adapter is holding content.
+    //
+    //  2. Temperature sensor > 0 °C: in D3-Cold the NVML/PDH thermal sensor
+    //     returns 0 because the sensor block is unpowered.  Any positive reading
+    //     means the package is at least partially awake.
+    //
+    // Deliberately NOT using gpu_util here: the wildcard PDH counter
+    // `\GPU Engine(*engtype_3D)\Utilization Percentage` captures every 3D engine
+    // across ALL adapters, including the iGPU running DWM at 1–5 %.
+    // `get_array_max` picks the highest value, so util is NEVER zero on a
+    // live desktop — making util a useless gate on Optimus/Advanced-Optimus.
+    let gpu_active = pdh.as_ref().map_or(false, |g| {
+        g.mem_used_mb > 256 || (g.temp_c > 0 && g.temp_c < 150)
+    });
+
+    if gpu_active {
+        // dGPU is awake (D0 / D3-Hot) and holding VRAM → safe to call nvidia-smi.
+        if let Some(smi) = query_nvidia_smi() {
+            return Some(smi);
+        }
+        // nvidia-smi unavailable — return PDH data as-is (util from iGPU noise
+        // is acceptable here because we know the dGPU is actually awake).
+        return pdh;
+    }
+
+    // dGPU is sleeping (D3-Cold).
+    // Sanitize the PDH data: strip iGPU "noise" from the 3D-engine utilisation
+    // counter so the GUI does not display phantom dGPU activity.
+    pdh.map(|mut g| {
+        g.name         = "NVIDIA GPU (Sleeping)".to_string();
+        g.gpu_util     = 0;
+        g.power_w      = 0.0;
+        g.clock_gpu_mhz = 0;
+        g.clock_mem_mhz = 0;
+        g
+    })
 }
 
-fn find_nvidia_smi() -> Option<PathBuf> {
+/// Resolve the path to nvidia-smi.exe once at startup.
+fn resolve_nvidia_smi() -> Option<PathBuf> {
     if Command::new("nvidia-smi.exe")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -76,6 +131,10 @@ fn find_nvidia_smi() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn find_nvidia_smi() -> Option<&'static PathBuf> {
+    NVIDIA_SMI_PATH.as_ref()
 }
 
 fn parse_nvidia_smi_line(line: &str) -> Option<GpuStatus> {
@@ -123,6 +182,7 @@ fn query_nvidia_smi() -> Option<GpuStatus> {
             return None;
         }
     };
+
     let output = Command::new(exe)
         .args([
             "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,enforced.power.limit,power.max_limit,memory.used,memory.total,clocks.gr,clocks.mem",
@@ -163,7 +223,7 @@ fn query_nvidia_smi() -> Option<GpuStatus> {
         }
     };
     debug!(
-        "nvidia-smi GPU: util={}%, mem={} / {}MB, temp={}°C, power={:.1}W/{:.1}W",
+        "nvidia-smi GPU: util={}%, mem={}/{}MB, temp={}°C, power={:.1}W/{:.1}W",
         sample.gpu_util,
         sample.mem_used_mb,
         sample.mem_total_mb,
@@ -171,6 +231,7 @@ fn query_nvidia_smi() -> Option<GpuStatus> {
         sample.power_w,
         sample.power_limit_w,
     );
+
     Some(sample)
 }
 

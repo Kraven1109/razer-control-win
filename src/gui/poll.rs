@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 // Persistent sysinfo System — kept alive across polls so CPU usage delta works.
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{Components, CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 lazy_static::lazy_static! {
     static ref SYS: std::sync::Mutex<System> = {
         let s = System::new_with_specifics(
@@ -16,6 +16,12 @@ lazy_static::lazy_static! {
                 .with_memory(MemoryRefreshKind::everything()),
         );
         std::sync::Mutex::new(s)
+    };
+    // Hardware thermal sensors.
+    // Components::new_with_refreshed_list() runs once; on each poll we cheap-refresh values.
+    // On Windows this queries ACPI thermal zones via WMI; gracefully returns empty if unavailable.
+    static ref COMPONENTS: std::sync::Mutex<Components> = {
+        std::sync::Mutex::new(Components::new_with_refreshed_list())
     };
 }
 
@@ -62,7 +68,38 @@ fn collect_sys() -> (SysMetrics, SysStatic) {
     let cpu_pct      = sys.global_cpu_usage();
     let ram_used_mb  = sys.used_memory() / 1024 / 1024;
     let ram_total_mb = sys.total_memory() / 1024 / 1024;
-    let metrics = SysMetrics { cpu_pct, ram_used_mb, ram_total_mb };
+
+    // Collect thermal sensor readings.
+    // On Windows, sysinfo reads ACPI thermal zones via WMI. Labels vary by firmware;
+    // we fall back to the hottest unlabeled zone as the CPU package estimate.
+    let (cpu_temp_c, ssd_temp_c) = {
+        let mut comps = COMPONENTS.lock().unwrap_or_else(|e| e.into_inner());
+        comps.refresh();
+        let mut cpu_temp: f32 = 0.0;
+        let mut ssd_temp: f32 = 0.0;
+        let mut fallback:  f32 = 0.0; // hottest unlabeled zone
+        for comp in comps.iter() {
+            let label = comp.label().to_ascii_lowercase();
+            let t = comp.temperature();
+            if t <= 0.0 || t > 120.0 { continue; }
+            if label.contains("cpu") || label.contains("core")
+                || label.contains("package") || label.contains("tctl")
+                || label.contains("tccd")
+            {
+                if t > cpu_temp { cpu_temp = t; }
+            } else if label.contains("ssd") || label.contains("nvme")
+                || label.contains("disk") || label.contains("storage")
+            {
+                if t > ssd_temp { ssd_temp = t; }
+            } else if t > fallback && t > 25.0 {
+                fallback = t; // unnamed thermal zone — likely CPU
+            }
+        }
+        if cpu_temp == 0.0 { cpu_temp = fallback; }
+        (cpu_temp, ssd_temp)
+    };
+
+    let metrics = SysMetrics { cpu_pct, ram_used_mb, ram_total_mb, cpu_temp_c, ssd_temp_c };
 
     const BIOS_KEY: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
     let laptop_model = reg_read_sz(BIOS_KEY, "SystemProductName");

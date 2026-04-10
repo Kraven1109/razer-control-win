@@ -83,6 +83,17 @@ impl Configuration {
         serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    pub fn reset_fan_profiles_to_auto(&mut self) -> bool {
+        let mut changed = false;
+        for slot in &mut self.power {
+            if slot.fan_rpm != 0 {
+                slot.fan_rpm = 0;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn write_to_file(&self) -> io::Result<()> {
         let dir = config_dir();
         fs::create_dir_all(&dir)?;

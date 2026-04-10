@@ -188,9 +188,13 @@ fn quantize_rpm(rpm: f32, min_rpm: f32, max_rpm: f32) -> f32 {
 
 #[derive(Clone, Default)]
 pub struct SysMetrics {
-    pub cpu_pct:     f32,
-    pub ram_used_mb: u64,
+    pub cpu_pct:      f32,
+    pub ram_used_mb:  u64,
     pub ram_total_mb: u64,
+    /// CPU package temperature in °C, 0.0 when the sensor is unavailable.
+    pub cpu_temp_c:   f32,
+    /// NVMe / SSD primary temperature in °C, 0.0 when unavailable.
+    pub ssd_temp_c:   f32,
 }
 
 // ── System static info (collected once) ───────────────────────────────────────
