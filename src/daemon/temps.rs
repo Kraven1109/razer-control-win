@@ -2,11 +2,16 @@
 ///
 /// Priority chain:
 ///   1. IOCTL_THERMAL_QUERY_INFORMATION via SetupDi (kernel thermal driver, ACPI zones).
-///   2. sysinfo WMI (MSAcpi_ThermalZoneTemperature) – same ACPI source, last resort.
+///   2. sysinfo WMI (all available system components).
 ///
-/// ⚠  On Razer Blade 16 (2023) both paths read the same ACPI _TMP method which
-///    Razer firmware holds at a static idle setpoint (~45 °C).  The accuracy is
-///    comparable to Windows Task Manager's thermal display on this hardware.
+/// ⚠  On Razer Blade 16 (2023) all known Windows user-mode temperature paths ultimately
+///    read ACPI `_TMP`, which is firmware-pinned to a static thermal trip-point (~45 °C).
+///    The only way to read the real die temperature on this hardware is via ring-0 MSR
+///    reads (IA32_THERM_STATUS 0x19C) — which HWiNFO64 / Core Temp do with their own
+///    kernel-mode drivers.  Without such a driver we can only surface what Windows exposes.
+///
+///    The first-run log will enumerate ALL sysinfo components; if any sensor is reading
+///    a live temperature it will be visible there.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -179,7 +184,16 @@ static SYS_COMPS: OnceLock<Mutex<sysinfo::Components>> = OnceLock::new();
 
 fn query_cpu_temp_sysinfo() -> f32 {
     let mutex = SYS_COMPS
-        .get_or_init(|| Mutex::new(sysinfo::Components::new_with_refreshed_list()));
+        .get_or_init(|| {
+            let comps = sysinfo::Components::new_with_refreshed_list();
+            // Log every visible component once at startup so we can see what
+            // sensors Windows actually exposes on this hardware.
+            log::info!("Thermal sensors found by sysinfo ({} total):", comps.len());
+            for c in comps.iter() {
+                log::info!("  [{:.1}°C] {:?}", c.temperature(), c.label());
+            }
+            Mutex::new(comps)
+        });
     let Ok(mut comps) = mutex.lock() else { return 0.0; };
     comps.refresh();
     comps.iter()

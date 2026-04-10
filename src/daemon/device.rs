@@ -804,7 +804,7 @@ impl RazerLaptop {
                                 } else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
                                     return Some(response);
                                 } else if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
-                                    warn!(
+                                    debug!(
                                         "HID command not supported: class=0x{:02X} cmd=0x{:02X}",
                                         report.command_class, report.command_id
                                     );
@@ -834,7 +834,37 @@ impl RazerLaptop {
         );
         None
     }
+
+    /// Expanded one-time probe: scan class 0x0D, 0x07, 0x0F, and 0x20 with
+    /// both zone 0x01 and 0x02.  Anything that returns a SUCCESSFUL response
+    /// is logged so we can identify live sensor data (temperature, power, etc.).
+    pub fn probe_ec_all(&mut self) {
+        info!("=== EC full probe start ===");
+        let probes: &[(u8, u8, u8)] = &[
+            (0x0D, 0x80, 0x9F),
+            (0x07, 0x80, 0x9F),
+            (0x0F, 0x80, 0x8F),
+            (0x20, 0x80, 0x9F),
+        ];
+        for &(class, id_lo, id_hi) in probes {
+            for id in id_lo..=id_hi {
+                for zone in [0x01u8, 0x02] {
+                    let mut report = RazerPacket::new(class, id, 0x02);
+                    report.args[0] = 0x00;
+                    report.args[1] = zone;
+                    if let Some(resp) = self.send_report(report) {
+                        info!(
+                            "  EC 0x{:02X}/0x{:02X} zone={} -> {:?}",
+                            class, id, zone, &resp.args[0..8]
+                        );
+                    }
+                }
+            }
+        }
+        info!("=== EC full probe end ===");
+    }
 }
+
 
 // ── BHO encoding helpers ───────────────────────────────────────────────────
 

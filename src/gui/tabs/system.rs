@@ -376,7 +376,7 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                             ui.add_space(SPC);
                             draw_tile_row(ui, tile_count, TILE_H, SPC, |ui, tile_idx| {
                                 match tile_idx {
-                                    0 => metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "Package sensor", CH_TEMP),
+                                    0 => metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "ACPI thermal zone", CH_TEMP),
                                     _ => metric_tile(ui, "Fan", format!("{} RPM", fan_rpm), "Razer EC", DIM),
                                 }
                             });

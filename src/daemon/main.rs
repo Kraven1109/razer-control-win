@@ -57,7 +57,12 @@ fn main() {
     if let Ok(mut d) = DEV_MANAGER.lock() {
         d.discover_devices();
         match d.get_device() {
-            Some(laptop) => info!("Device found: {}", laptop.get_name()),
+            Some(laptop) => {
+                info!("Device found: {}", laptop.get_name());
+                // One-time EC command probe — discover all readable EC data so we
+                // can identify any thermal/sensor commands the firmware exposes.
+                laptop.probe_ec_all();
+            }
             None => {
                 error!(
                     "No supported Razer device found.\n\
@@ -340,6 +345,10 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                 })
             }
             comms::DaemonCommand::GetSysTemps => {
+                // All Windows user-mode temperature APIs on Razer Blade 16 (2023) read
+                // ACPI _TMP which the firmware pins to ~45 °C.  Real die temperature
+                // requires a ring-0 MSR read — currently not available without a kernel
+                // driver.  The ACPI value is the best we can do in user-space.
                 let (cpu_temp_c, _) = temps::query_sys_temps();
                 Some(comms::DaemonResponse::GetSysTemps { cpu_temp_c })
             }
