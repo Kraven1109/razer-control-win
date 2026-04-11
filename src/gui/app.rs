@@ -23,7 +23,11 @@ pub struct Pwr {
     pub mode: u8,
     pub cpu: u8,
     pub gpu: u8,
+    /// User-configured manual fan target RPM. 0 = auto mode.
+    /// Never overwritten by live tachometer polling — used by power tab for mode detection.
     pub fan: i32,
+    /// Live tachometer reading from EC (0x0D/0x88 or fallback). Always non-zero when spinning.
+    pub fan_live: i32,
     pub bright: u8,
     pub logo: u8,
     /// Temperature-target mode (°C). 0 = disabled.  When positive the GUI
@@ -34,7 +38,7 @@ pub struct Pwr {
 
 impl Default for Pwr {
     fn default() -> Self {
-        Self { mode: 0, cpu: 0, gpu: 0, fan: 0, bright: 50, logo: 1, temp_target: 0 }
+        Self { mode: 0, cpu: 0, gpu: 0, fan: 0, fan_live: 0, bright: 50, logo: 1, temp_target: 0 }
     }
 }
 

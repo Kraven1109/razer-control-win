@@ -343,13 +343,19 @@ impl DeviceManager {
             .unwrap_or(0)
     }
 
+    /// Returns the user-configured manual target (0 = auto mode).
+    /// Used by GetFanSpeed IPC — the power tab needs this for mode detection.
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
-        if let Some(laptop) = self.get_device() {
-            if laptop.ac_state as usize == ac {
-                return laptop.get_fan_rpm() as i32;
-            }
-        }
         self.fan_overrides[ac.min(1)]
+    }
+
+    /// Returns the live measured fan RPM from the EC tachometer.
+    /// Falls back to configured target if EC read fails.
+    pub fn get_fan_tachometer(&mut self) -> i32 {
+        if let Some(laptop) = self.get_device() {
+            return laptop.get_fan_tachometer() as i32;
+        }
+        0
     }
 
     pub fn get_power_mode(&mut self, ac: usize) -> u8 {
@@ -473,6 +479,9 @@ pub struct RazerLaptop {
     fan_rpm: u8,
     pub ac_state: u8,
     screensaver: bool,
+    /// EC command used to read live fan RPM (detected once on first poll).
+    /// 0x88 = tachometer (actual RPM), 0x81 = set-point, None = unsupported.
+    fan_read_cmd: Option<u8>,
 }
 
 impl RazerLaptop {
@@ -506,6 +515,7 @@ impl RazerLaptop {
             fan_rpm: 0,
             ac_state: 0,
             screensaver: false,
+            fan_read_cmd: None,
         }
     }
 
@@ -695,8 +705,47 @@ impl RazerLaptop {
         true
     }
 
-    pub fn get_fan_rpm(&self) -> u16 {
-        self.fan_rpm as u16 * 100
+    /// Read the *actual measured* fan RPM from the EC (tachometer).
+    ///
+    /// On the first call the method probes which EC command the firmware supports
+    /// (0x0D/0x88 tachometer → 0x0D/0x81 set-point → none) and caches the result
+    /// so every subsequent poll is a single HID round-trip with no log spam.
+    ///
+    /// The result: `info!` logged once at detection time; `warn!` if neither command
+    /// works (so you can diagnose it at default log level without `RAZER_LOG=debug`).
+    pub fn get_fan_tachometer(&mut self) -> u16 {
+        // Lazy probe: try 0x88 (tachometer) then 0x81 (set-point) once.
+        if self.fan_read_cmd.is_none() {
+            // Sentinel: Some(0) means "nothing works, use cached"
+            self.fan_read_cmd = Some(0);
+            for &cmd_id in &[0x88u8, 0x81u8] {
+                let mut probe = RazerPacket::new(0x0d, cmd_id, 0x02);
+                probe.args[0] = 0x00;
+                probe.args[1] = 0x01;
+                if self.send_report(probe).map(|r| r.args[2] > 0).unwrap_or(false) {
+                    let label = if cmd_id == 0x88 { "tachometer" } else { "set-point" };
+                    info!("fan_rpm: EC 0x0D/0x{:02X} ({}) selected for {}", cmd_id, label, self.name);
+                    self.fan_read_cmd = Some(cmd_id);
+                    break;
+                }
+            }
+            if self.fan_read_cmd == Some(0) {
+                warn!("fan_rpm: no EC command supported on {} — showing configured target", self.name);
+            }
+        }
+
+        match self.fan_read_cmd {
+            Some(cmd_id) if cmd_id > 0 => {
+                let mut report = RazerPacket::new(0x0d, cmd_id, 0x02);
+                report.args[0] = 0x00;
+                report.args[1] = 0x01;
+                self.send_report(report)
+                    .map(|r| r.args[2] as u16 * 100)
+                    .filter(|&rpm| rpm > 0)
+                    .unwrap_or(self.fan_rpm as u16 * 100)
+            }
+            _ => self.fan_rpm as u16 * 100,
+        }
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {
@@ -833,35 +882,6 @@ impl RazerLaptop {
             report.command_class, report.command_id
         );
         None
-    }
-
-    /// Expanded one-time probe: scan class 0x0D, 0x07, 0x0F, and 0x20 with
-    /// both zone 0x01 and 0x02.  Anything that returns a SUCCESSFUL response
-    /// is logged so we can identify live sensor data (temperature, power, etc.).
-    pub fn probe_ec_all(&mut self) {
-        info!("=== EC full probe start ===");
-        let probes: &[(u8, u8, u8)] = &[
-            (0x0D, 0x80, 0x9F),
-            (0x07, 0x80, 0x9F),
-            (0x0F, 0x80, 0x8F),
-            (0x20, 0x80, 0x9F),
-        ];
-        for &(class, id_lo, id_hi) in probes {
-            for id in id_lo..=id_hi {
-                for zone in [0x01u8, 0x02] {
-                    let mut report = RazerPacket::new(class, id, 0x02);
-                    report.args[0] = 0x00;
-                    report.args[1] = zone;
-                    if let Some(resp) = self.send_report(report) {
-                        info!(
-                            "  EC 0x{:02X}/0x{:02X} zone={} -> {:?}",
-                            class, id, zone, &resp.args[0..8]
-                        );
-                    }
-                }
-            }
-        }
-        info!("=== EC full probe end ===");
     }
 }
 

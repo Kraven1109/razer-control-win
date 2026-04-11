@@ -43,6 +43,8 @@ pub enum DaemonCommand {
     SetGamingMode { win_key: bool, alt_tab: bool, alt_f4: bool },
     /// Request CPU and SSD temperatures from the daemon (runs elevated).
     GetSysTemps,
+    /// Live fan RPM from the EC tachometer (model-agnostic).
+    GetFanTachometer,
 }
 
 // ── Responses sent FROM the daemon ────────────────────────────────────────
@@ -94,6 +96,8 @@ pub enum DaemonResponse {
     SetGamingMode { result: bool },
     /// CPU temperature (°C) from the daemon's PDH/WMI sensor.
     GetSysTemps { cpu_temp_c: f32 },
+    /// Live fan RPM from the EC tachometer.
+    GetFanTachometer { rpm: i32 },
 }
 
 // ── Client helpers ─────────────────────────────────────────────────────────

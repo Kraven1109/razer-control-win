@@ -140,7 +140,7 @@ pub fn poll_pwr_slot(ac: usize) -> Pwr {
     if let Some(comms::DaemonResponse::GetFanSpeed { rpm }) =
         send(comms::DaemonCommand::GetFanSpeed { ac })
     {
-        p.fan = rpm;
+        p.fan = rpm; // configured manual target (0 = auto)
     }
     if let Some(comms::DaemonResponse::GetBrightness { result }) =
         send(comms::DaemonCommand::GetBrightness { ac })
@@ -198,6 +198,13 @@ pub fn do_poll() -> PollData {
 
     data.ac = poll_pwr_slot(1);
     data.bat = poll_pwr_slot(0);
+    // Live tachometer is AC-independent; assign to whichever slot is active.
+    if let Some(comms::DaemonResponse::GetFanTachometer { rpm }) =
+        send(comms::DaemonCommand::GetFanTachometer)
+    {
+        data.ac.fan_live = rpm;
+        data.bat.fan_live = rpm;
+    }
 
     if let Some(comms::DaemonResponse::GetSync { sync }) =
         send(comms::DaemonCommand::GetSync())

@@ -195,7 +195,10 @@ fn query_cpu_temp_sysinfo() -> f32 {
             Mutex::new(comps)
         });
     let Ok(mut comps) = mutex.lock() else { return 0.0; };
-    comps.refresh();
+    // Windows WMI note: refresh() re-reads from an already-instantiated WbemClassObject
+    // which can return stale cached values.  refresh_list() re-executes the WQL query,
+    // forcing the ACPI WMI Bridge to provide a fresh CurrentTemperature read.
+    comps.refresh_list();
     comps.iter()
         .map(|c| c.temperature())
         .filter(|&t| t > 20.0 && t < 110.0)

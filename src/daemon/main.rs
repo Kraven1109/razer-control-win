@@ -57,12 +57,7 @@ fn main() {
     if let Ok(mut d) = DEV_MANAGER.lock() {
         d.discover_devices();
         match d.get_device() {
-            Some(laptop) => {
-                info!("Device found: {}", laptop.get_name());
-                // One-time EC command probe — discover all readable EC data so we
-                // can identify any thermal/sensor commands the firmware exposes.
-                laptop.probe_ec_all();
-            }
+            Some(laptop) => info!("Device found: {}", laptop.get_name()),
             None => {
                 error!(
                     "No supported Razer device found.\n\
@@ -272,6 +267,9 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
             }
             comms::DaemonCommand::GetFanSpeed { ac } => {
                 Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac) })
+            }
+            comms::DaemonCommand::GetFanTachometer => {
+                Some(comms::DaemonResponse::GetFanTachometer { rpm: d.get_fan_tachometer() })
             }
             comms::DaemonCommand::GetPwrLevel { ac } => {
                 Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) })

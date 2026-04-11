@@ -231,7 +231,7 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
             let cpu_pct      = app.sys.cpu_pct;
             let ram_used_mb  = app.sys.ram_used_mb;
             let ram_total_mb = app.sys.ram_total_mb;
-            let fan_rpm      = app.ac.fan;       // Razer EC fan RPM
+            let fan_rpm      = app.ac.fan_live;  // Razer EC live tachometer
 
             // Capture total_w once — everything in this arm (side-by-side cards,
             // History chart, System Info) is pinned to this exact width so they
@@ -354,7 +354,7 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                         ui.set_min_width(right_w);
                         ui.set_max_width(right_w);
                         card_inner(ui, "System", "Performance counters", |ui| {
-                            let has_fan  = fan_rpm > 0;
+                            let has_fan  = true; // always live from EC 0x0D/0x81
                             let cpu_col  = if cpu_pct < 60.0 { OK } else if cpu_pct < 85.0 { WARN } else { ERR };
                             let ram_pct  = if ram_total_mb > 0 { ram_used_mb * 100 / ram_total_mb } else { 0 };
                             let ram_col  = if ram_pct < 70 { OK } else if ram_pct < 85 { WARN } else { ERR };
@@ -377,7 +377,7 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
                             draw_tile_row(ui, tile_count, TILE_H, SPC, |ui, tile_idx| {
                                 match tile_idx {
                                     0 => metric_tile(ui, "CPU Temp", cpu_temp_str.clone(), "ACPI thermal zone", CH_TEMP),
-                                    _ => metric_tile(ui, "Fan", format!("{} RPM", fan_rpm), "Razer EC", DIM),
+                                    _ => metric_tile(ui, "Fan", format!("{} RPM", fan_rpm), "Razer EC (live)", DIM),
                                 }
                             });
                         });
