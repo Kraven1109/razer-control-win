@@ -1,6 +1,6 @@
 /// System monitor tab — GPU metrics card and history charts.
 
-use crate::app::{App, GpuInfo, Sample};
+use crate::app::{App, BannerTone, GpuInfo, Sample};
 use crate::constants::*;
 use crate::widgets::{card, card_inner, chip, draw_page_header, metric_tile, row as info_row};
 use eframe::egui::{
@@ -417,30 +417,66 @@ pub fn draw_system(app: &mut App, ui: &mut Ui) {
     }
 
     // ── Startup settings card — always visible regardless of GPU availability ─
-    draw_startup_card(ui);
+    draw_startup_card(ui, app);
 }
 
-fn draw_startup_card(ui: &mut Ui) {
-    card(ui, "Startup", "System integration settings", |ui| {
+fn draw_startup_card(ui: &mut Ui, app: &mut App) {
+    card(ui, "Startup", "Auto-start daemon and GUI at logon", |ui| {
         ui.set_min_width(ui.available_width());
 
-        let autostart = crate::tray::is_autostart_enabled();
-        info_row(ui, "Start on boot", "Launch GUI minimized to tray on Windows login", |ui| {
-            let mut checked = autostart;
-            if ui.checkbox(&mut checked, "").changed() {
-                crate::tray::toggle_autostart();
+        // ── Row 1: Daemon at startup (master switch) ────────────────────────
+        info_row(ui, "Run daemon at startup", "Start razer-daemon elevated at logon (Task Scheduler)", |ui| {
+            let old = app.run_at_startup;
+            if ui.checkbox(&mut app.run_at_startup, "").changed() {
+                let result = if app.run_at_startup {
+                    crate::startup::register()
+                } else {
+                    // Turning daemon off also disables GUI autostart
+                    if crate::tray::is_autostart_enabled() {
+                        crate::tray::set_autostart(false);
+                    }
+                    crate::startup::unregister()
+                };
+                match result {
+                    Ok(()) => { app.save_gui_config(); }
+                    Err(e) => {
+                        app.run_at_startup = old; // revert
+                        app.set_banner(BannerTone::Warn, format!("Startup task error: {e}"));
+                    }
+                }
             }
         });
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(
-                "Registers razer-gui.exe in the current user's Run registry key. \
-                 The daemon must be started separately with Administrator privileges \
-                 (e.g. via a Task Scheduler entry set to run elevated at logon).",
-            )
-            .size(11.0)
-            .color(SOFT),
-        );
+
+        // ── Row 2: GUI at startup (child, only meaningful if daemon is registered) ──
+        if app.run_at_startup {
+            ui.add_space(2.0);
+            info_row(ui, "Start GUI minimized", "Also launch razer-gui to tray at logon", |ui| {
+                let autostart = crate::tray::is_autostart_enabled();
+                let mut checked = autostart;
+                if ui.checkbox(&mut checked, "").changed() {
+                    crate::tray::set_autostart(checked);
+                    app.save_gui_config();
+                }
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "The GUI connects to the daemon via TCP. \
+                     The daemon must start first — the 10-second Task Scheduler delay ensures this.",
+                )
+                .size(11.0)
+                .color(SOFT),
+            );
+        } else {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(
+                    "Enable \"Run daemon at startup\" to unlock GUI autostart.",
+                )
+                .size(11.0)
+                .color(SOFT),
+            );
+        }
     });
 }
 

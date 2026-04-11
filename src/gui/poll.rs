@@ -167,7 +167,6 @@ pub fn do_poll() -> PollData {
         effect_args: Vec::new(),
         bho: false,
         bho_thr: 80,
-        fn_swap: false,
         on_ac: is_on_ac(),
         battery_pct: battery_percent(),
         gpu: None,
@@ -209,11 +208,6 @@ pub fn do_poll() -> PollData {
     {
         data.bho = is_on;
         data.bho_thr = threshold;
-    }
-    if let Some(comms::DaemonResponse::GetFnSwap { swap }) =
-        send(comms::DaemonCommand::GetFnSwap())
-    {
-        data.fn_swap = swap;
     }
     if let Some(comms::DaemonResponse::GetCurrentEffect { name, args }) =
         send(comms::DaemonCommand::GetCurrentEffect)

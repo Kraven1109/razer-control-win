@@ -1,2 +1,9 @@
 /target/
 Cargo.lock
+
+# Local scratch / notes — not part of the project
+*.png
+code_revise.md
+SOS.md
+usb_tree_port10.md
+tools/

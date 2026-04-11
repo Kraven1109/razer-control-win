@@ -428,30 +428,6 @@ impl DeviceManager {
             .and_then(|l| l.get_bho().map(byte_to_bho))
     }
 
-    pub fn get_fn_swap_handler(&mut self) -> Option<bool> {
-        self.get_device().and_then(|l| l.get_fn_swap())
-    }
-
-    pub fn set_fn_swap_handler(&mut self, swap: bool) -> bool {
-        let Some(laptop) = self.get_device() else {
-            return false;
-        };
-
-        if !laptop.set_fn_swap(swap) {
-            return false;
-        }
-
-        for _ in 0..3 {
-            thread::sleep(Duration::from_millis(40));
-            if let Some(current) = laptop.get_fn_swap() {
-                if current == swap {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     pub fn get_rapl_limits(&mut self, ac: usize) -> (u32, u32) {
         self.get_ac_config(ac)
             .map(|c| (c.rapl_pl1_watts, c.rapl_pl2_watts))
@@ -798,21 +774,6 @@ impl RazerLaptop {
             debug!("BHO response: {:?}", r);
             true
         })
-    }
-
-    pub fn get_fn_swap(&mut self) -> Option<bool> {
-        let mut report = RazerPacket::new(0x02, 0x86, 0x02);
-        report.id = 0xFF;
-        report.args[0] = 0x00;
-        self.send_report(report).map(|r| r.args[1] != 0)
-    }
-
-    pub fn set_fn_swap(&mut self, swap: bool) -> bool {
-        let mut report = RazerPacket::new(0x02, 0x06, 0x02);
-        report.id = 0xFF;
-        report.args[0] = 0x00;
-        report.args[1] = swap as u8;
-        self.send_report(report).is_some()
     }
 
     /// Read the EC's feature-report response.

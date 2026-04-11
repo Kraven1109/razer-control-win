@@ -122,11 +122,32 @@ fn main() {
 // ── Logging ────────────────────────────────────────────────────────────────
 
 fn init_logging() {
+    // When built as /SUBSYSTEM:WINDOWS (no console window) stderr is discarded.
+    // Write logs to %APPDATA%\razercontrol\daemon.log so they remain accessible
+    // for debugging even when the daemon is running invisibly in the background.
+    let log_path = {
+        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+        std::path::PathBuf::from(appdata).join("razercontrol").join("daemon.log")
+    };
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     let mut builder = env_logger::Builder::from_default_env();
-    builder.target(env_logger::Target::Stderr);
     builder.filter_level(log::LevelFilter::Info);
     builder.format_timestamp_millis();
     builder.parse_env("RAZER_LOG");
+
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    } else {
+        builder.target(env_logger::Target::Stderr);
+    }
+
     builder.init();
 }
 
@@ -162,16 +183,24 @@ fn start_keyboard_animator_task() -> JoinHandle<()> {
 }
 
 fn start_gpu_monitor_task() -> JoinHandle<()> {
-    thread::spawn(|| loop {
-        let on_ac = power::is_on_ac();
-        // Poll more aggressively on AC; give the battery a break
-        thread::sleep(time::Duration::from_secs(if on_ac { 3 } else { 10 }));
-
-        if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
-            continue;
-        }
+    thread::spawn(|| {
+        // Do one query immediately so the cache is populated before the first
+        // GUI poll arrives (which may happen within a second of startup).
         if let Some(status) = gpu::query_gpu() {
             gpu::store_gpu_cache(&status);
+        }
+
+        loop {
+            let on_ac = power::is_on_ac();
+            // Poll more aggressively on AC; give the battery a break
+            thread::sleep(time::Duration::from_secs(if on_ac { 3 } else { 10 }));
+
+            if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(status) = gpu::query_gpu() {
+                gpu::store_gpu_cache(&status);
+            }
         }
     })
 }
@@ -403,21 +432,6 @@ fn process_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
                     .and_then(|mut k| k.get_current_effect_info())
                     .unwrap_or_else(|| (String::new(), vec![]));
                 Some(comms::DaemonResponse::GetCurrentEffect { name, args })
-            }
-            comms::DaemonCommand::SetFnSwap { swap } => {
-                let ok = d.set_fn_swap_handler(swap);
-                if ok {
-                    info!("Fn key swap verified at state {}", swap);
-                } else {
-                    warn!(
-                        "Fn key swap write did not persist; Blade 16 likely uses Synapse's storage plus bladeNative path instead of a standalone hardware toggle"
-                    );
-                }
-                Some(comms::DaemonResponse::SetFnSwap { result: ok })
-            }
-            comms::DaemonCommand::GetFnSwap() => {
-                let swap = d.get_fn_swap_handler().unwrap_or(false);
-                Some(comms::DaemonResponse::GetFnSwap { swap })
             }
             comms::DaemonCommand::SetGamingMode {
                 win_key,

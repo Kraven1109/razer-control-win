@@ -32,6 +32,11 @@ pub struct GuiConfig {
     pub low_bat_lighting: bool,
     #[serde(default = "default_low_bat_pct")]
     pub low_bat_pct: u8,
+    /// Whether the user has requested the daemon to run at logon via Task Scheduler.
+    /// The actual task presence is the source of truth; this is only used to
+    /// initialise the UI toggle on startup.
+    #[serde(default)]
+    pub run_at_startup: bool,
 }
 
 fn default_low_bat_pct() -> u8 { 20 }

@@ -20,6 +20,7 @@ mod widgets;
 mod tabs;
 mod display;
 mod gui_config;
+mod startup;
 mod tray;
 
 use app::{App, Tab};
@@ -272,7 +273,13 @@ impl eframe::App for App {
                     ui.add_space(4.0);
 
                     // Daemon dot + status text.
-                    let (st, sc) = if self.ok { ("ONLINE", OK) } else { ("OFFLINE", ERR) };
+                    let (st, sc) = if self.ok {
+                        ("ONLINE", OK)
+                    } else if !self.first_poll_received {
+                        ("...", constants::WARN)
+                    } else {
+                        ("OFFLINE", ERR)
+                    };
                     ui.horizontal(|ui| {
                         let (dot_r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
                         ui.painter_at(dot_r).circle_filled(dot_r.center(), 3.5, sc);
@@ -309,18 +316,31 @@ impl eframe::App for App {
                             .rounding(egui::Rounding::same(18.0))
                             .inner_margin(egui::Margin { left: 26.0, right: 26.0, top: 24.0, bottom: 24.0 })
                             .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Cannot connect to razer-daemon")
-                                        .size(18.0).strong().color(TEXT),
-                                );
-                                ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new(
-                                        "Run razer-daemon.exe as Administrator, then reopen the GUI.",
-                                    )
-                                    .size(12.0)
-                                    .color(DIM),
-                                );
+                                if self.first_poll_received {
+                                    ui.label(
+                                        RichText::new("Cannot connect to razer-daemon")
+                                            .size(18.0).strong().color(TEXT),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Run razer-daemon.exe as Administrator, then reopen the GUI.",
+                                        )
+                                        .size(12.0)
+                                        .color(DIM),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new("Connecting to razer-daemon\u{2026}")
+                                            .size(18.0).strong().color(TEXT),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("Please wait\u{2026}")
+                                            .size(12.0)
+                                            .color(DIM),
+                                    );
+                                }
                             });
                     });
                     return;

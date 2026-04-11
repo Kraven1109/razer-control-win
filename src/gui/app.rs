@@ -223,7 +223,6 @@ pub struct PollData {
     pub effect_args: Vec<u8>,
     pub bho: bool,
     pub bho_thr: u8,
-    pub fn_swap: bool,
     pub on_ac: bool,
     pub battery_pct: u8,
     pub gpu: Option<GpuInfo>,
@@ -242,6 +241,9 @@ pub struct App {
     pub tab: Tab,
     // Daemon state — updated by background poll.
     pub ok: bool,
+    /// True once the first poll result has been received from the background thread.
+    /// Used to distinguish "still connecting" from "connection failed".
+    pub first_poll_received: bool,
     pub devname: String,
     pub ac: Pwr,
     pub bat: Pwr,
@@ -276,8 +278,8 @@ pub struct App {
     pub gaming_win_key: bool,
     pub gaming_alt_tab: bool,
     pub gaming_alt_f4: bool,
-    // Fn key swap (daemon EC HID).
-    pub fn_swap: bool,
+    // Startup: run daemon at logon via Task Scheduler.
+    pub run_at_startup: bool,
     // Display refresh-rate (GUI-only).
     pub bat_low_refresh: bool,
     pub display_rates: Vec<u32>,
@@ -327,6 +329,7 @@ impl App {
         Self {
             tab: Tab::Ac,
             ok: false,
+            first_poll_received: false,
             devname: "Unknown".into(),
             ac: Pwr::default(),
             bat: Pwr::default(),
@@ -356,7 +359,9 @@ impl App {
             gaming_win_key: gui_cfg.gaming_win_key,
             gaming_alt_tab: gui_cfg.gaming_alt_tab,
             gaming_alt_f4: gui_cfg.gaming_alt_f4,
-            fn_swap: false,
+            // Check the real task presence rather than the stored preference so
+            // the toggle reflects reality if the task was removed externally.
+            run_at_startup: crate::startup::is_registered(),
             bat_low_refresh: gui_cfg.bat_low_refresh,
             display_rates: rates,
             display_rate_high: rate_high,
@@ -386,6 +391,7 @@ impl App {
             bat_low_refresh: self.bat_low_refresh,
             low_bat_lighting: self.low_bat_lighting,
             low_bat_pct: self.low_bat_pct,
+            run_at_startup: self.run_at_startup,
         };
         let _ = cfg.save();
     }
@@ -601,6 +607,7 @@ impl App {
 
     /// Merge a PollData result into App state.
     pub fn apply_poll(&mut self, data: PollData) {
+        self.first_poll_received = true;
         self.ok = data.ok;
 
         // ── GUI-only features (work even without daemon) ────────────────
@@ -652,7 +659,6 @@ impl App {
         self.sync = data.sync;
         self.bho = data.bho;
         self.bho_thr = data.bho_thr;
-        self.fn_swap = data.fn_swap;
 
         // Only sync effect from daemon when user has no pending local edits.
         if !self.effect_dirty && !data.effect_name.is_empty() {

@@ -216,3 +216,12 @@ pub fn toggle_autostart() {
 pub fn is_autostart_enabled() -> bool { false }
 #[cfg(not(windows))]
 pub fn toggle_autostart() {}
+#[cfg(not(windows))]
+pub fn set_autostart(_enable: bool) {}
+
+#[cfg(windows)]
+pub fn set_autostart(enable: bool) {
+    if enable != is_autostart_enabled() {
+        toggle_autostart();
+    }
+}

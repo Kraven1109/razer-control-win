@@ -1,7 +1,9 @@
 /// GPU monitoring for Windows.
 ///
 /// Query priority chain:
-///   1. NVML (NVIDIA Management Library) — direct DLL call, <1 ms/poll, no subprocess.
+///   1. NVML (NVIDIA Management Library) — direct DLL call, ~1–5 ms/poll, no subprocess.
+///      Opened and closed on every poll so the driver connection does not persist between
+///      polls, allowing the dGPU to enter D3-Cold freely.
 ///   2. nvidia-smi subprocess — fallback when NVML fails to initialise.
 ///   3. PDH (Windows Performance Data Helper) — lightweight gatekeeper to avoid waking
 ///      a sleeping dGPU unnecessarily; also primary data source when above are absent.
@@ -11,10 +13,16 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use lazy_static::lazy_static;
 use log::*;
+
+/// CREATE_NO_WINDOW — prevents nvidia-smi/find_msvc from flashing a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 lazy_static! {
     static ref GPU_STATUS_CACHE: Mutex<Option<GpuStatus>> = Mutex::new(None);
@@ -83,6 +91,10 @@ pub fn query_gpu() -> Option<GpuStatus> {
     // across ALL adapters, including the iGPU running DWM at 1–5 %.
     // `get_array_max` picks the highest value, so util is NEVER zero on a
     // live desktop — making util a useless gate on Optimus/Advanced-Optimus.
+    //
+    // map_or(false, …): if PDH failed to initialise we have no passive signal.
+    // We fall through to the nvidia-smi path below rather than risk waking the
+    // sleeping GPU via NVML.
     let gpu_active = pdh.as_ref().map_or(false, |g| {
         g.mem_used_mb > 256 || (g.temp_c > 0 && g.temp_c < 150)
     });
@@ -100,7 +112,14 @@ pub fn query_gpu() -> Option<GpuStatus> {
         return pdh;
     }
 
-    // dGPU is sleeping (D3-Cold).
+    // dGPU is sleeping (D3-Cold), OR PDH itself failed.
+    // If PDH failed entirely, fall back to nvidia-smi as a last resort.
+    // nvidia-smi exits after each query so it does not hold the GPU awake.
+    if pdh.is_none() {
+        return query_nvidia_smi();
+    }
+
+    // dGPU confirmed sleeping via PDH gatekeeper.
     // Sanitize the PDH data: strip iGPU "noise" from the 3D-engine utilisation
     // counter so the GUI does not display phantom dGPU activity.
     pdh.map(|mut g| {
@@ -115,34 +134,25 @@ pub fn query_gpu() -> Option<GpuStatus> {
 
 // ── NVML (NVIDIA Management Library) ─────────────────────────────────────
 //
-// Preferred over nvidia-smi subprocess: direct DLL call (<1 ms) with no
-// process-spawn overhead.  Loaded dynamically at runtime via nvml.dll which
-// ships with every NVIDIA driver install.
+// Opened and closed on every poll so the driver connection is not held open
+// between polls.  A persistent NVML connection can prevent the dGPU from
+// entering D3-Cold on some Optimus / Advanced-Optimus configurations, which
+// would result in idle power draw of 20-30 W that should otherwise be ~0 W.
 //
-// The `Nvml` handle is initialised once and cached.  Per-poll `Device` handles
-// are obtained fresh from the cached `Nvml` — these are cheap index look-ups.
-
-#[cfg(windows)]
-static NVML_HANDLE: OnceLock<Option<nvml_wrapper::Nvml>> = OnceLock::new();
+// nvmlInit / nvmlShutdown are fast (< 5 ms each) so the per-poll overhead is
+// negligible compared to the 3-second poll interval.
 
 #[cfg(windows)]
 fn query_nvml() -> Option<GpuStatus> {
     use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 
-    let handle = NVML_HANDLE.get_or_init(|| {
-        match nvml_wrapper::Nvml::init() {
-            Ok(n) => {
-                info!("NVML initialised — fast GPU path active");
-                Some(n)
-            }
-            Err(e) => {
-                debug!("NVML init failed ({e}); will use nvidia-smi");
-                None
-            }
-        }
-    }).as_ref()?;
+    // Init fresh for this poll; will be dropped (→ nvmlShutdown) at function return.
+    let nvml = match nvml_wrapper::Nvml::init() {
+        Ok(n)  => n,
+        Err(e) => { warn!("NVML init failed ({e}); falling back to nvidia-smi"); return None; }
+    };
 
-    let device = handle.device_by_index(0).ok()?;
+    let device = nvml.device_by_index(0).ok()?;
 
     let name          = device.name().ok()?;
     let temp_c        = device.temperature(TemperatureSensor::Gpu).ok()? as i32;
@@ -191,6 +201,7 @@ fn resolve_nvidia_smi() -> Option<PathBuf> {
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .ok()?
         .success()
@@ -261,6 +272,7 @@ fn query_nvidia_smi() -> Option<GpuStatus> {
             "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,enforced.power.limit,power.max_limit,memory.used,memory.total,clocks.gr,clocks.mem",
             "--format=csv,noheader,nounits",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     let output = match output {

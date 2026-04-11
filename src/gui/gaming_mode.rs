@@ -19,7 +19,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_F4, VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_TAB,
+    GetAsyncKeyState,
+    VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_TAB,
+    VK_F4,
 };
 #[cfg(windows)]
 use windows::core::PCWSTR;
@@ -32,8 +34,8 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 
 static BLOCK_WIN_KEY: AtomicBool = AtomicBool::new(false);
 static BLOCK_ALT_TAB: AtomicBool = AtomicBool::new(false);
-static BLOCK_ALT_F4: AtomicBool = AtomicBool::new(false);
-static ALT_HELD: AtomicBool = AtomicBool::new(false);
+static BLOCK_ALT_F4:  AtomicBool = AtomicBool::new(false);
+static ALT_HELD:      AtomicBool = AtomicBool::new(false);
 static SUPPRESS_ALT_UP: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -69,7 +71,7 @@ pub fn is_any_active() -> bool {
 }
 
 /// Update which keys are blocked. Installs the hook if at least one block is
-/// on, removes it when all are off.
+/// on or fn-swap is active, removes it when all are off.
 pub fn set_blocks(win_key: bool, alt_tab: bool, alt_f4: bool) {
     BLOCK_WIN_KEY.store(win_key, Ordering::Relaxed);
     BLOCK_ALT_TAB.store(alt_tab, Ordering::Relaxed);

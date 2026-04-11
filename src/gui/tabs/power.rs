@@ -14,10 +14,6 @@ const POWER_MODES: [&str; 5] = ["Balanced", "Gaming", "Creator", "Silent", "Cust
 const CPU_BOOST_MODES: [&str; 4] = ["Low", "Medium", "High", "Boost"];
 const GPU_BOOST_MODES: [&str; 3] = ["Low", "Medium", "High"];
 
-fn fn_swap_is_known_unsupported(devname: &str) -> bool {
-    devname.contains("Blade 16 (2023)") || devname.contains("RZ09-0483")
-}
-
 pub fn draw_power(app: &mut App, ui: &mut Ui, is_ac: bool) {
     let title    = if is_ac { "AC Profile"      } else { "Battery Profile"   };
     let subtitle = if is_ac {
@@ -348,47 +344,6 @@ pub fn draw_power(app: &mut App, ui: &mut Ui, is_ac: bool) {
 
     // ── System features card (both tabs) ──────────────────────────────────
     card(ui, "System features", "Keyboard, input and display tweaks", |ui| {
-        let fn_swap_supported = !fn_swap_is_known_unsupported(&app.devname);
-        let fn_label = if fn_swap_supported {
-            if app.fn_swap {
-                "ON — media keys primary"
-            } else {
-                "OFF — F-keys primary"
-            }
-        } else {
-            "Unavailable on Blade 16 (2023)"
-        };
-
-        row(ui, "Fn key swap", fn_label, |ui| {
-            let old = app.fn_swap;
-            let changed = ui
-                .add_enabled(fn_swap_supported, egui::Checkbox::without_text(&mut app.fn_swap))
-                .changed();
-            if changed {
-                match send(comms::DaemonCommand::SetFnSwap { swap: app.fn_swap }) {
-                    Some(comms::DaemonResponse::SetFnSwap { result: true }) => {
-                        app.wake_poll();
-                    }
-                    _ => {
-                        app.fn_swap = old; // revert on failure
-                        app.set_banner(
-                            BannerTone::Warn,
-                            "Fn key swap did not stick after write. Blade 16 likely needs the proprietary Synapse path.",
-                        );
-                    }
-                }
-            }
-        });
-
-        if !fn_swap_supported {
-            rowsep(ui);
-            ui.label(
-                "This model reports the same top-row HID events in both func and multi modes, and no standalone hardware mode-set packet has been confirmed yet. Synapse rewrites app storage and also loads its proprietary bladeNative layer on Windows, so this toggle stays disabled until that path is understood.",
-            );
-        }
-
-        rowsep(ui);
-
         row(ui, "Block Win key", "Prevent accidental Start menu", |ui| {
             let old = app.gaming_win_key;
             if ui.checkbox(&mut app.gaming_win_key, "").changed() {

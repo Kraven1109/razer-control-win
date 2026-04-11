@@ -21,11 +21,12 @@ razer-daemon   ←──IPC (bincode/TCP)──→  razer-gui / razer-cli
     ├── kbd/       HID keyboard (brightness, effects)
     ├── power.rs   ACPI power profile (WMI / HID)
     └── gpu.rs     PDH-first GPU monitor:
-                   • Always query PDH (passive, no GPU wake)
+                   • PDH query is persistent (OnceLock, init once at daemon start)
                    • Gate: VRAM > 256 MB OR temp > 0 °C → dGPU awake
-                   • If awake: call nvidia-smi for full telemetry
-                   • If sleeping (D3-Cold): sanitize PDH, zero util/power/clocks,
-                     set name = "NVIDIA GPU (Sleeping)"
+                   •   awake: NVML (per-poll init+drop) → nvidia-smi → PDH
+                   •   sleeping: sanitize PDH → name="NVIDIA GPU (Sleeping)"
+                   •   PDH failed: fall back to nvidia-smi unconditionally
+                   • NVML handle dropped after each poll (no persistent connection)
 ```
 
 IPC message types defined in `src/lib.rs` (`DaemonCommand` / `DaemonResponse`).
@@ -163,14 +164,30 @@ Temp | TGP only when data available.
 
 ## New Features (Session 2025-07 — Synapse Replacement)
 
-### 1. Fn Key Swap (EC HID)
-Toggle between F-keys primary and media-keys primary via EC HID.
-- Class 0x02, cmd 0x06 (set) / 0x86 (get).
-- Legacy OpenRazer-compatible packet uses transaction_id `0xFF`.
-- Daemon IPC: `SetFnSwap { swap: bool }` / `GetFnSwap()`.
-- The daemon now treats the write as successful only if a read-back matches the requested state.
-- On Blade 16 2023 the EC may still ACK the legacy packet without changing keyboard behaviour; this strongly suggests Synapse uses a newer proprietary path for `functionKeyPrimary` on this model.
-- Files: `device.rs` (get_fn_swap/set_fn_swap), `comms.rs`, `daemon/main.rs`.
+### 1. Fn Key Swap — NOT SUPPORTED (removed)
+Attempted and removed. Do not re-add without solving the root issues.
+
+**Goal**: Toggle F-keys primary / media-keys primary on Blade 16 2023.
+
+**What was tried**:
+1. **EC HID** — Class 0x02, cmd 0x06 (set) / 0x86 (get). EC acknowledges but hardware is
+   unaffected on Blade 16 2023 (PID 0x029F). OpenRazer doesn't list `fn_toggle` for this model.
+2. **Elevated in-process WH_KEYBOARD_LL in daemon** — Hook sees VK_VOLUME_MUTE etc. and suppresses
+   them. But `SendInput(VK_F1)` from elevated daemon is blocked by Windows UIPI before reaching
+   non-elevated foreground windows. Key becomes a no-op.
+3. **Out-of-process medium-IL helper `razer-kbd-hook.exe`** — spawned via `explorer.exe` launcher
+   (to avoid `SE_ASSIGNPRIMARYTOKEN` needed by `CreateProcessWithTokenW`). Daemon ↔ helper via
+   TCP 127.0.0.1:29495. Helper installs WH_KEYBOARD_LL at medium IL, `SendInput` should work.
+   Tested. Still did not work — exact reason unknown (Razer driver may handle the keys below
+   WH_KEYBOARD_LL, or the helper was not receiving them reliably).
+
+**Conclusion**: Not feasible with current knowledge. All fn_swap code removed from codebase.
+
+**If revisiting**:
+- Confirm with AutoHotKey: `#IfWinActive` + `Volume_Mute::F1` — if AHK can do it, our hook can too.
+- If AHK can also NOT intercept it, Razer driver handles the key at kernel level below user-mode hooks.
+- Consider kernel driver (filter driver) or Razer SDK path if they release one.
+- Medium-IL helper + WH_KEYBOARD_LL is the correct architecture IF the key reaches user-mode hooks.
 
 ### 2. Gaming Mode (Keyboard Hooks)
 Block Win key, Alt+Tab, Alt+F4 while gaming using Windows low-level keyboard hooks.
@@ -219,11 +236,6 @@ Each power mode shows a brief description (Balanced, Gaming, Creator, Silent, Cu
 
 - **VRAM total on GeForce** — PDH `Dedicated Limit` unavailable; show just "X MB used" for now.
   Proper fix: add `Win32_Graphics_Dxgi` feature and query adapter memory via DXGI.
-- **PDH handle caching** — `query_pdh_gpu()` currently opens a fresh PDH query, registers
-  counters, and sleeps 250 ms every 3 s poll cycle.  For lower CPU overhead, cache the
-  `PDH_HQUERY` and `PDH_HCOUNTER` handles in a `lazy_static` struct and call only
-  `PdhCollectQueryData` each cycle (open/close once at startup, not per-poll).  Low priority
-  since the daemon idles between polls.
 - **`nvidia-powerd` equivalent** — Windows enforces TGP via WMI/HID; verify the daemon
   path on fresh installs (no Synapse required once daemon installs WMI provider).
 - **Intel XTU undervolting** — Razer uses IntelOverclockingSDK.dll (.NET managed) for PL1/PL2/
@@ -238,6 +250,80 @@ Each power mode shows a brief description (Balanced, Gaming, Creator, Silent, Cu
 - **Dual display mode** — Blade 16 supports 1920×1200 ↔ 3840×2400 native OLED switching.
   Requires bladeNative.dll research; deferred.
 - **Battery profile** — IPC path works; needs more real-world testing on battery discharge.
+
+---
+
+## Session 2026-04 — GPU display + power + UX fixes
+
+### GPU info not showing (root cause: PDH gatekeeper bug)
+**Root cause**: `query_gpu()` used `pdh.as_ref().map_or(false, ...)` — when PDH init failed
+(empty OnceLock → None returned), `gpu_active` was false. The final `pdh.map(...)` also
+returned None so the cache was never populated.
+**Fix**: Two-pronged:
+1. `map_or(false, …)` kept (preserves D3-Cold gating) but a new `if pdh.is_none()` branch
+   tries nvidia-smi as fallback before giving up. nvidia-smi exits after each query, so it
+   cannot hold the GPU awake.
+2. `start_gpu_monitor_task()` now does one immediate query before the first 3-second sleep,
+   so the cache is populated before the first GUI poll arrives.
+
+### NVML per-poll (no persistent library handle)
+**Root cause**: `NVML_HANDLE: OnceLock<Option<Nvml>>` kept the NVML connection open for the
+daemon's lifetime. On some Optimus / Advanced-Optimus systems a persistent NVML handle can
+prevent the dGPU from entering D3-Cold, causing 20-30 W idle draw.
+**Fix**: Removed the OnceLock. `query_nvml()` now calls `Nvml::init()` at the start of each
+poll and drops the handle at function return (nvmlShutdown via Drop). Overhead < 5 ms per
+poll, negligible vs. the 3-second interval.
+**Note**: DWM-caused P0 (NVIDIA Overlay / Advanced-Optimus display path) is a Windows/driver
+issue unrelated to the daemon — confirmed by GPU staying at P0 after stopping our binaries.
+
+### GUI "Connecting to daemon…" on load
+**Root cause**: `App::ok` starts false; before the first poll result arrives, the central
+panel immediately showed "Cannot connect to razer-daemon".
+**Fix**: Added `App::first_poll_received: bool` (default false, set true by `apply_poll`).
+- `!ok && !first_poll_received` → "Connecting to razer-daemon…" panel
+- `!ok && first_poll_received`  → "Cannot connect" error panel
+- Sidebar status dot shows amber `...` while connecting.
+
+### UAC manifest for razer-daemon.exe
+Added `build.rs` with:
+```rust
+println!("cargo:rustc-link-arg-bin=razer-daemon=/MANIFESTUAC:level='requireAdministrator'");
+```
+Windows now auto-prompts for elevation when razer-daemon.exe is launched from Explorer.
+
+### "GPU: cached" label corrected
+`src/gui/widgets.rs` showed `"GPU: cached"` for all non-PDH GPU names. The cache is always
+fresh (updated every 3 s), so the label was misleading. Changed to `"GPU: live"`.
+
+---
+
+## EC Probe Tool (`tools/ec_probe.py`)
+
+Zero-dependency Python script (pure ctypes, `hid.dll` + `setupapi.dll`).
+
+```powershell
+# Stop daemon first — it holds mi_02 exclusively
+uv run tools/ec_probe.py --fan-temp          # quick targeted probe
+uv run tools/ec_probe.py --dump 0x0D 0x88    # dump single command, all zones
+# Full scan: uv run tools/ec_probe.py
+```
+
+Results saved to `tools/razer_ec_map.json` + `tools/razer_ec_map.txt`.
+
+### Blade 16 (2023) HID interface layout
+
+| Interface | Status | Notes |
+|-----------|--------|-------|
+| `mi_00\kbd` | blocked | keyboard driver claims it |
+| `mi_00&col03`, `mi_01&colXX` | opens OK | no feature reports; SetFeature fails |
+| **`mi_02`** | **EC control** | daemon opens exclusively; supports feature reports |
+
+### Windows HID / ctypes pitfalls (64-bit)
+- `SetupDiGetClassDevsW.restype = c_void_p` — **required** on 64-bit; default `c_int` truncates pointer
+- `SP_DEVICE_INTERFACE_DATA.Reserved` must be `c_size_t` (8 bytes = ULONG_PTR), not `c_ulong` (4 bytes)
+- `SetupDiGetDeviceInterfaceDetailW` third arg = raw `c_void_p` buffer; `cbSize` field = 8 on 64-bit
+- Two-step pattern: first call with NULL to get required buffer size, then allocate and retry
+- `wstring_at(addr + 4)` reads DevicePath (offset 4 = sizeof DWORD `cbSize`)
 
 ---
 
@@ -258,12 +344,39 @@ cargo build --bin razer-gui
 
 # Run daemon (requires admin for HID + WMI)
 .\target\debug\razer-daemon.exe
+# NOTE: release build has /SUBSYSTEM:WINDOWS so no console window appears.
+# Logs go to %APPDATA%\razercontrol\daemon.log
 
 # CLI test
 .\target\debug\razer-cli.exe write power ac 2 0 0   # Gaming, no custom boost
 .\target\debug\razer-cli.exe read power
-.\target\debug\razer-cli.exe read fn-swap
-.\target\debug\razer-cli.exe write fn-swap on
+
+```
+
+## Startup (no-console autostart)
+
+`razer-daemon.exe` (release) is built with `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup` so
+it runs with no console window — exactly like a background service.
+
+**One-time setup** (run from elevated PowerShell after `cargo build --release`):
+```powershell
+# Register as a Task Scheduler task (at logon, highest privileges)
+.\scripts\install-daemon-task.ps1
+
+# Start immediately without rebooting:
+Start-ScheduledTask -TaskName "RazerDaemon"
+```
+
+Logs: `%APPDATA%\razercontrol\daemon.log`
+
+To view live:
+```powershell
+Get-Content "$env:APPDATA\razercontrol\daemon.log" -Wait -Tail 30
+```
+
+To stop:
+```powershell
+Stop-ScheduledTask -TaskName "RazerDaemon"  # or kill the process
 ```
 
 ---

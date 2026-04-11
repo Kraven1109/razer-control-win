@@ -203,7 +203,7 @@ pub fn draw_page_header(ui: &mut Ui, title: &str, subtitle: &str, app: &App) {
                     {
                         "GPU: PDH counters"
                     }
-                    Some(_) => "GPU: cached",
+                    Some(_) => "GPU: live",
                     None => "GPU: N/A",
                 };
                 chip(
