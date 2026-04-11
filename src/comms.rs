@@ -41,8 +41,6 @@ pub enum DaemonCommand {
     SetFnSwap { swap: bool },
     GetFnSwap(),
     SetGamingMode { win_key: bool, alt_tab: bool, alt_f4: bool },
-    /// Request CPU and SSD temperatures from the daemon (runs elevated).
-    GetSysTemps,
     /// Live fan RPM from the EC tachometer (model-agnostic).
     GetFanTachometer,
 }
@@ -94,8 +92,6 @@ pub enum DaemonResponse {
     SetFnSwap { result: bool },
     GetFnSwap { swap: bool },
     SetGamingMode { result: bool },
-    /// CPU temperature (°C) from the daemon's PDH/WMI sensor.
-    GetSysTemps { cpu_temp_c: f32 },
     /// Live fan RPM from the EC tachometer.
     GetFanTachometer { rpm: i32 },
 }

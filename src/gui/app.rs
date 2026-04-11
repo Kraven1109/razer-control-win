@@ -195,8 +195,6 @@ pub struct SysMetrics {
     pub cpu_pct:      f32,
     pub ram_used_mb:  u64,
     pub ram_total_mb: u64,
-    /// CPU package temperature in °C, 0.0 when the sensor is unavailable.
-    pub cpu_temp_c:   f32,
 }
 
 // ── System static info (collected once) ───────────────────────────────────────

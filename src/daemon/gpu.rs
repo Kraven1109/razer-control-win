@@ -1,19 +1,17 @@
 /// GPU monitoring for Windows.
 ///
-/// Strategy:
-///
-/// 1. Prefer `nvidia-smi` for the discrete NVIDIA GPU. This gives accurate
-///    temperature, power, clocks, and dedicated VRAM for the graph.
-/// 2. Fall back to PDH / Task Manager counters when `nvidia-smi` is not
-///    available. PDH is still useful for lightweight telemetry, but it is not
-///    reliable enough on its own for all metrics on Optimus systems.
+/// Query priority chain:
+///   1. NVML (NVIDIA Management Library) — direct DLL call, <1 ms/poll, no subprocess.
+///   2. nvidia-smi subprocess — fallback when NVML fails to initialise.
+///   3. PDH (Windows Performance Data Helper) — lightweight gatekeeper to avoid waking
+///      a sleeping dGPU unnecessarily; also primary data source when above are absent.
 ///
 /// The GPU monitor thread calls `query_gpu()` every few seconds and stores the
 /// result in `GPU_STATUS_CACHE` which the daemon reads for `GetGpuStatus` IPC.
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use lazy_static::lazy_static;
 use log::*;
@@ -90,12 +88,15 @@ pub fn query_gpu() -> Option<GpuStatus> {
     });
 
     if gpu_active {
-        // dGPU is awake (D0 / D3-Hot) and holding VRAM → safe to call nvidia-smi.
+        // dGPU is awake — try NVML first (sub-millisecond, no subprocess).
+        if let Some(nvml) = query_nvml() {
+            return Some(nvml);
+        }
+        // NVML unavailable — fall back to nvidia-smi subprocess.
         if let Some(smi) = query_nvidia_smi() {
             return Some(smi);
         }
-        // nvidia-smi unavailable — return PDH data as-is (util from iGPU noise
-        // is acceptable here because we know the dGPU is actually awake).
+        // Both unavailable — return PDH data as-is.
         return pdh;
     }
 
@@ -111,6 +112,78 @@ pub fn query_gpu() -> Option<GpuStatus> {
         g
     })
 }
+
+// ── NVML (NVIDIA Management Library) ─────────────────────────────────────
+//
+// Preferred over nvidia-smi subprocess: direct DLL call (<1 ms) with no
+// process-spawn overhead.  Loaded dynamically at runtime via nvml.dll which
+// ships with every NVIDIA driver install.
+//
+// The `Nvml` handle is initialised once and cached.  Per-poll `Device` handles
+// are obtained fresh from the cached `Nvml` — these are cheap index look-ups.
+
+#[cfg(windows)]
+static NVML_HANDLE: OnceLock<Option<nvml_wrapper::Nvml>> = OnceLock::new();
+
+#[cfg(windows)]
+fn query_nvml() -> Option<GpuStatus> {
+    use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
+
+    let handle = NVML_HANDLE.get_or_init(|| {
+        match nvml_wrapper::Nvml::init() {
+            Ok(n) => {
+                info!("NVML initialised — fast GPU path active");
+                Some(n)
+            }
+            Err(e) => {
+                debug!("NVML init failed ({e}); will use nvidia-smi");
+                None
+            }
+        }
+    }).as_ref()?;
+
+    let device = handle.device_by_index(0).ok()?;
+
+    let name          = device.name().ok()?;
+    let temp_c        = device.temperature(TemperatureSensor::Gpu).ok()? as i32;
+    let util          = device.utilization_rates().ok()?;
+    let power_mw      = device.power_usage().ok()?;
+    let limit_mw      = device.power_management_limit().ok()?;
+    let mem           = device.memory_info().ok()?;
+    let clk_gpu       = device.clock_info(Clock::Graphics).ok()?;
+    let clk_mem       = device.clock_info(Clock::Memory).ok()?;
+    let max_limit_mw  = device.power_management_limit_constraints()
+        .ok()
+        .map(|c| c.max_limit)
+        .unwrap_or(limit_mw);
+
+    debug!(
+        "NVML GPU: util={}%, mem={}/{}MB, temp={}°C, power={:.1}W/{:.1}W",
+        util.gpu,
+        mem.used / 1_048_576,
+        mem.total / 1_048_576,
+        temp_c,
+        power_mw as f32 / 1000.0,
+        limit_mw as f32 / 1000.0,
+    );
+
+    Some(GpuStatus {
+        name,
+        temp_c,
+        gpu_util:         util.gpu as u8,
+        mem_util:         util.memory as u8,
+        power_w:          power_mw as f32 / 1000.0,
+        power_limit_w:    limit_mw as f32 / 1000.0,
+        power_max_limit_w: max_limit_mw as f32 / 1000.0,
+        mem_used_mb:      (mem.used  / 1_048_576) as u32,
+        mem_total_mb:     (mem.total / 1_048_576) as u32,
+        clock_gpu_mhz:    clk_gpu,
+        clock_mem_mhz:    clk_mem,
+    })
+}
+
+#[cfg(not(windows))]
+fn query_nvml() -> Option<GpuStatus> { None }
 
 /// Resolve the path to nvidia-smi.exe once at startup.
 fn resolve_nvidia_smi() -> Option<PathBuf> {
@@ -235,148 +308,150 @@ fn query_nvidia_smi() -> Option<GpuStatus> {
     Some(sample)
 }
 
-// ── PDH fallback — Windows Performance Data Helper ─────────────────────────
+// ── PDH fallback — Persistent Windows Performance Data Helper ──────────────
 //
-// Uses the same counters exposed in Task Manager:
-//   \GPU Engine(*engtype_3D)\Utilization Percentage
-//   \GPU Adapter Memory(*)\Dedicated Usage
-//   \GPU Local Adapter Memory(*)\Local Usage
-//
-// PDH wildcard counters return arrays (one entry per GPU engine / adapter).
-// We aggregate conservatively: max across 3D engine instances and max across
-// adapter memory instances. This keeps the fallback simple and typically picks
-// the discrete adapter on systems where it exposes dedicated memory usage.
+// The PDH query is opened ONCE at daemon startup and kept alive.
+// Subsequent polls call PdhCollectQueryData only (no sleep, no open/close).
+// The 250 ms primer sleep happens exactly once so rate counters have a
+// baseline sample before the first read.
 
 #[cfg(windows)]
-fn query_pdh_gpu() -> Option<GpuStatus> {
+struct GpuPdhState {
+    query:       isize,    // PDH_HQUERY
+    h_util:      isize,    // PDH_HCOUNTER — GPU Engine 3D utilisation
+    h_vram_used: isize,    // PDH_HCOUNTER — Dedicated Memory Usage
+    h_vram_total:isize,    // PDH_HCOUNTER — Dedicated Memory Limit
+    h_temp:      isize,    // PDH_HCOUNTER — GPU Thermal (optional)
+    temp_added:  bool,
+    buffer:      Vec<u8>,  // scratch buffer for PdhGetFormattedCounterArrayW
+}
+
+// SAFETY: GpuPdhState is only ever accessed through Mutex<Option<GpuPdhState>>.
+#[cfg(windows)] unsafe impl Send for GpuPdhState {}
+#[cfg(windows)] unsafe impl Sync for GpuPdhState {}
+
+#[cfg(windows)]
+static GPU_PDH_STATE: OnceLock<Mutex<Option<GpuPdhState>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn init_gpu_pdh() -> Option<GpuPdhState> {
+    use std::os::windows::ffi::OsStrExt;
     use windows::{
         core::PCWSTR,
         Win32::System::Performance::{
-            PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-            PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W,
-            PDH_FMT_DOUBLE,
+            PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhOpenQueryW,
         },
     };
-    // PDH handles are raw isize in windows 0.58 (not exported as type aliases)
-    #[allow(non_camel_case_types)] type PDH_HQUERY = isize;
-    #[allow(non_camel_case_types)] type PDH_HCOUNTER = isize;
 
     fn wide(s: &str) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        std::ffi::OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    // PDH_MORE_DATA reserved for future error handling
-
-    unsafe fn get_array_max(hc: PDH_HCOUNTER) -> Option<f64> {
-        unsafe {
-            let mut buf_size: u32 = 0;
-            let mut count: u32 = 0;
-            let ret = PdhGetFormattedCounterArrayW(
-                hc,
-                PDH_FMT_DOUBLE,
-                &mut buf_size,
-                &mut count,
-                None,
-            );
-            if buf_size == 0 {
-                return None;
-            }
-            // PDH_MORE_DATA or ERROR_SUCCESS both acceptable at size-query
-            let _ = ret;
-
-            let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            let needed = (buf_size as usize).max(item_size * count as usize);
-            let mut buf: Vec<u8> = vec![0u8; needed];
-            let items_ptr = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-            let ret2 = PdhGetFormattedCounterArrayW(
-                hc,
-                PDH_FMT_DOUBLE,
-                &mut buf_size,
-                &mut count,
-                Some(items_ptr),
-            );
-            if ret2 != 0 {
-                return None;
-            }
-            let mut max_val = 0.0_f64;
-            for i in 0..count as usize {
-                let item = &*items_ptr.add(i);
-                let v = item.FmtValue.Anonymous.doubleValue;
-                if v > max_val {
-                    max_val = v;
-                }
-            }
-            Some(max_val)
-        }
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
     unsafe {
-        let mut query: PDH_HQUERY = 0;
+        let mut query: isize = 0;
         if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
             return None;
         }
 
-        let mut h_util: PDH_HCOUNTER = 0;
-        let mut h_vram_used: PDH_HCOUNTER = 0;
-        let mut h_vram_total: PDH_HCOUNTER = 0;
-        let mut h_temp: PDH_HCOUNTER = 0;
+        let mut h_util      = 0_isize;
+        let mut h_vram_used = 0_isize;
+        let mut h_vram_total= 0_isize;
+        let mut h_temp      = 0_isize;
 
         let path_util  = wide("\\GPU Engine(*engtype_3D)\\Utilization Percentage");
-        // Use max instead of sum for memory counters — the RTX 4090 has the
-        // largest dedicated VRAM budget, so max() selects that adapter and
-        // ignores the Intel iGPU (which shows a much smaller or zero value).
         let path_used  = wide("\\GPU Adapter Memory(*)\\Dedicated Usage");
         let path_total = wide("\\GPU Adapter Memory(*)\\Dedicated Limit");
-        // Wildcard thermal counter — discrete GPU is hotter, so max gives RTX temp.
         let path_temp  = wide("\\GPU Thermal(*)\\Temperature");
 
-        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_util.as_ptr()),  0, &mut h_util);
-        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_used.as_ptr()),  0, &mut h_vram_used);
-        let _ = PdhAddEnglishCounterW(query, PCWSTR(path_total.as_ptr()), 0, &mut h_vram_total);
-        // Thermal counter: ignore failure — not present on all systems/drivers.
-        let temp_added =
-            PdhAddEnglishCounterW(query, PCWSTR(path_temp.as_ptr()), 0, &mut h_temp) == 0;
-
-        // First collection — needed before rate counters produce values
-        let _ = PdhCollectQueryData(query);
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        // Second collection — counters are now computable
-        if PdhCollectQueryData(query) != 0 {
+        if PdhAddEnglishCounterW(query, PCWSTR(path_util.as_ptr()),  0, &mut h_util) != 0 ||
+           PdhAddEnglishCounterW(query, PCWSTR(path_used.as_ptr()),  0, &mut h_vram_used) != 0 ||
+           PdhAddEnglishCounterW(query, PCWSTR(path_total.as_ptr()), 0, &mut h_vram_total) != 0
+        {
             PdhCloseQuery(query);
             return None;
         }
 
-        let util = get_array_max(h_util).unwrap_or(0.0).min(100.0);
-        // Use max to pick the discrete RTX adapter (largest VRAM budget).
-        let vram_used_bytes  = get_array_max(h_vram_used).unwrap_or(0.0);
-        let vram_total_bytes = get_array_max(h_vram_total).unwrap_or(0.0);
+        // Thermal is optional — not present on all driver versions
+        let temp_added = PdhAddEnglishCounterW(query, PCWSTR(path_temp.as_ptr()), 0, &mut h_temp) == 0;
 
-        // Temperature: max across all thermal instances — RTX runs hotter and
-        // exposes a real sensor; iGPU either returns 0 or a lower value.
-        let temp_c = if temp_added {
-            get_array_max(h_temp).unwrap_or(0.0).clamp(0.0, 150.0) as i32
+        // ONE-TIME 250 ms primer: rate counters need two samples to produce a value.
+        // This happens at daemon startup while the rest of the daemon initialises.
+        PdhCollectQueryData(query);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        PdhCollectQueryData(query);
+
+        info!("PDH GPU counters initialised (persistent)");
+
+        Some(GpuPdhState {
+            query,
+            h_util,
+            h_vram_used,
+            h_vram_total,
+            h_temp,
+            temp_added,
+            buffer: vec![0u8; 4096],
+        })
+    }
+}
+
+#[cfg(windows)]
+fn query_pdh_gpu() -> Option<GpuStatus> {
+    use windows::Win32::System::Performance::{
+        PdhCollectQueryData, PdhGetFormattedCounterArrayW, PDH_FMT_COUNTERVALUE_ITEM_W,
+        PDH_FMT_DOUBLE, PDH_MORE_DATA,
+    };
+
+    let cell  = GPU_PDH_STATE.get_or_init(|| Mutex::new(init_gpu_pdh()));
+    let mut lock = cell.lock().unwrap();
+    let state = lock.as_mut()?;
+
+    unsafe {
+        // Instant collect — uses the inter-poll interval as the sampling window
+        if PdhCollectQueryData(state.query) != 0 {
+            return None;
+        }
+
+        // Helper: get max value across all counter instances for a given handle
+        macro_rules! get_max {
+            ($hc:expr) => {{
+                let mut buf_size = state.buffer.len() as u32;
+                let mut count    = 0_u32;
+                let mut ret = PdhGetFormattedCounterArrayW(
+                    $hc, PDH_FMT_DOUBLE, &mut buf_size, &mut count,
+                    Some(state.buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
+                );
+                if ret == PDH_MORE_DATA {
+                    state.buffer.resize(buf_size as usize, 0);
+                    ret = PdhGetFormattedCounterArrayW(
+                        $hc, PDH_FMT_DOUBLE, &mut buf_size, &mut count,
+                        Some(state.buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
+                    );
+                }
+                if ret == 0 && count > 0 {
+                    let items = state.buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W;
+                    (0..count as usize)
+                        .map(|i| (*items.add(i)).FmtValue.Anonymous.doubleValue)
+                        .fold(0.0_f64, f64::max)
+                } else {
+                    0.0_f64
+                }
+            }};
+        }
+
+        let util           = get_max!(state.h_util).min(100.0);
+        let vram_used_bytes = get_max!(state.h_vram_used);
+        let vram_total_bytes= get_max!(state.h_vram_total);
+        let temp_c = if state.temp_added {
+            get_max!(state.h_temp).clamp(0.0, 150.0) as i32
         } else {
             0
         };
-
-        PdhCloseQuery(query);
 
         let mem_used_mb  = (vram_used_bytes  / 1_048_576.0) as u32;
         let mem_total_mb = (vram_total_bytes / 1_048_576.0) as u32;
-        let mem_util = if mem_total_mb > 0 {
-            (mem_used_mb * 100 / mem_total_mb) as u8
-        } else {
-            0
-        };
+        let mem_util = if mem_total_mb > 0 { (mem_used_mb * 100 / mem_total_mb) as u8 } else { 0 };
 
-        debug!(
-            "PDH GPU: util={:.1}% vram={}/{}MB temp={}°C",
-            util, mem_used_mb, mem_total_mb, temp_c
-        );
+        debug!("PDH GPU: util={:.1}% vram={}/{}MB temp={}°C", util, mem_used_mb, mem_total_mb, temp_c);
 
         Some(GpuStatus {
             name: "GPU (Task Manager counters)".to_string(),

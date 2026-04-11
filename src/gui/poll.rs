@@ -63,7 +63,7 @@ fn collect_sys() -> (SysMetrics, SysStatic) {
     let ram_used_mb  = sys.used_memory() / 1024 / 1024;
     let ram_total_mb = sys.total_memory() / 1024 / 1024;
 
-    let metrics = SysMetrics { cpu_pct, ram_used_mb, ram_total_mb, cpu_temp_c: 0.0 };
+    let metrics = SysMetrics { cpu_pct, ram_used_mb, ram_total_mb };
 
     const BIOS_KEY: &str = r"HARDWARE\DESCRIPTION\System\BIOS";
     let laptop_model = reg_read_sz(BIOS_KEY, "SystemProductName");
@@ -188,13 +188,6 @@ pub fn do_poll() -> PollData {
     };
     data.ok = true;
     data.devname = name;
-
-    // Ask the daemon for CPU/SSD temperatures (needs admin for the NVMe IOCTL).
-    if let Some(comms::DaemonResponse::GetSysTemps { cpu_temp_c }) =
-        send(comms::DaemonCommand::GetSysTemps)
-    {
-        data.sys.cpu_temp_c = cpu_temp_c;
-    }
 
     data.ac = poll_pwr_slot(1);
     data.bat = poll_pwr_slot(0);
